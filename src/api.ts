@@ -48,7 +48,7 @@ async function configureMonitor(env: Env, monitorId: string): Promise<void> {
   const id = env.MONITORS.idFromName(monitorId);
   const stub = env.MONITORS.get(id);
 
-  const response = await stub.fetch("https://probot.internal/configure", {
+  const response = await stub.fetch("https://farpoint.internal/configure", {
     method: "POST",
     headers: JSON_HEADERS,
     body: JSON.stringify({ monitorId }),
@@ -62,7 +62,7 @@ async function configureMonitor(env: Env, monitorId: string): Promise<void> {
 async function stopMonitor(env: Env, monitorId: string): Promise<void> {
   const id = env.MONITORS.idFromName(monitorId);
   const stub = env.MONITORS.get(id);
-  await stub.fetch("https://probot.internal/schedule", { method: "DELETE" });
+  await stub.fetch("https://farpoint.internal/schedule", { method: "DELETE" });
 }
 
 function normaliseInput(
