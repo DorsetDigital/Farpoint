@@ -1,8 +1,8 @@
-# ProBot
+# Farpoint
 
-ProBot is a small, external uptime and performance monitor designed to integrate with a hosting platform.
+Farpoint is a small, external uptime and performance monitor designed to integrate with a hosting platform.
 
-It runs on Cloudflare Workers, so the monitor is independent of the infrastructure it is watching. Each site is checked with a real HTTP GET of the public page and ProBot records both availability and the time taken to receive the HTML response body.
+It runs on Cloudflare Workers, so the monitor is independent of the infrastructure it is watching. Each site is checked with a real HTTP GET of the public page and Farpoint records both availability and the time taken to receive the HTML response body.
 
 ## What the first PoC does
 
@@ -59,7 +59,7 @@ curl -X POST http://localhost:8787/api/v1/monitors \
   }'
 ~~~
 
-The stable scheduling offset is assigned by ProBot and returned with the monitor.
+The stable scheduling offset is assigned by Farpoint and returned with the monitor.
 
 For a five-minute monitor with an offset of 22 seconds, checks occur at times such as:
 
@@ -89,7 +89,7 @@ DELETE /api/v1/monitors/:id
 GET    /api/v1/monitors/:id/results?limit=50
 ~~~
 
-`GET /health` is deliberately unauthenticated and reports only the health of the ProBot Worker itself.
+`GET /health` is deliberately unauthenticated and reports only the health of the Farpoint Worker itself.
 
 ## Optional content checks
 
