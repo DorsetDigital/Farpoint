@@ -1,5 +1,5 @@
 {
-  "name": "probot",
+  "name": "farpoint",
   "version": "0.1.0",
   "private": true,
   "description": "External uptime and performance monitoring on Cloudflare Workers",
