@@ -1,13 +1,13 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "probot",
+  "name": "farpoint",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "probot"
+      "database_name": "farpoint"
     }
   ],
   "durable_objects": {
