@@ -9,7 +9,7 @@ export default {
 
     if (url.pathname === "/health") {
       return Response.json({
-        service: "ProBot",
+        service: "Farpoint",
         status: "ok",
         timestamp: new Date().toISOString(),
       });
@@ -19,7 +19,7 @@ export default {
       return handleApi(request, env);
     }
 
-    return new Response("ProBot is watching. 👀", {
+    return new Response("Farpoint is watching. 👀", {
       status: 200,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
