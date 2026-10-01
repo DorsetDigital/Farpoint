@@ -39,7 +39,7 @@ export async function checkMonitor(
       headers: {
         Accept: "text/html,application/xhtml+xml",
         "User-Agent":
-          "ProBot/0.1 (+https://github.com/DorsetDigital/ProBot)",
+          "Farpoint/0.1 (+https://github.com/DorsetDigital/Farpoint)",
       },
     });
 
