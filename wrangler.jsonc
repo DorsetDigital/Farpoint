@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "probot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "probot"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MONITORS",
+        "class_name": "Monitor"
+      }
+    ]
+  },
+  "exports": {
+    "Monitor": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "vars": {
+    "CONTROL_PANEL_BASE_URL": ""
+  }
+}
