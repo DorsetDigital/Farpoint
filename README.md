@@ -240,3 +240,18 @@ For long-range reporting, use daily stats. Hourly stats are useful for shorter-t
 ## Status
 
 This repository is currently a proof of concept. The next useful steps are a real Cloudflare deployment, a small parallel pilot alongside the existing uptime service, and then control-panel integration.
+
+
+## HTML dashboard
+
+Farpoint includes a lightweight operator dashboard at:
+
+~~~text
+/dashboard
+~~~
+
+The prototype is deliberately self-contained HTML/CSS/JavaScript so the UI can be reused later inside the Silverstripe control panel.
+
+For the standalone Farpoint version, enter the API key in the page. It is kept only in browser memory and is not persisted. The page refreshes every 10 seconds and supports search, state filtering, sorting and pagination.
+
+The eventual Silverstripe integration should keep the same UI layer but replace the browser-side bearer-token fetch with a server-side proxy/controller, so the Farpoint API key never needs to be exposed to end users.
