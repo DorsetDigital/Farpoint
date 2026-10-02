@@ -129,6 +129,8 @@ Two consecutive HTML responses taking longer than three seconds would transition
 
 A completely failed request is handled separately. While a failure is awaiting confirmation, Farpoint retries after 10 seconds rather than waiting for the normal monitoring interval. With the default failure confirmation count of 2, the second failed check can therefore confirm `DOWN` roughly 10 seconds after the first failure. Once downtime is confirmed, checks return to the normal monitoring interval.
 
+Recovery uses the same fast-confirmation approach. When a `DOWN` monitor first succeeds, Farpoint retries after 10 seconds until the configured recovery confirmation count is reached. Once recovery is confirmed, the monitor returns to its normal cadence.
+
 The first successful check also sends a one-off Slack confirmation — **Q-bot is watching** — so adding a monitor gives positive confirmation that Farpoint has actually checked it successfully.
 
 ## Cloudflare deployment
