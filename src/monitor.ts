@@ -8,7 +8,7 @@ import {
   recordIncidentTransition,
   rollupCompletedDay,
 } from "./history";
-import { nextScheduledTime } from "./schedule";
+import { nextCheckTime, nextScheduledTime } from "./schedule";
 import { notifyStateChange } from "./slack";
 import { transitionState } from "./state";
 import type { Env, MonitorRow } from "./types";
@@ -135,12 +135,7 @@ export class Monitor extends DurableObject<Env> {
           transition.state,
           checkedAt,
         );
-      }
 
-      const initialHealthy =
-        monitor.current_state === "UNKNOWN" && transition.state === "UP";
-
-      if (stateChanged && !initialHealthy) {
         const refreshed = {
           ...monitor,
           current_state: transition.state,
@@ -162,9 +157,12 @@ export class Monitor extends DurableObject<Env> {
       await this.runDailyMaintenance(monitor.id, checkedAt);
 
       await this.ctx.storage.setAlarm(
-        nextScheduledTime(
+        nextCheckTime(
           monitor.interval_seconds,
           monitor.offset_seconds,
+          result.ok,
+          transition.counters.consecutiveFailures,
+          monitor.failure_confirmation_checks,
           Date.now(),
         ),
       );
