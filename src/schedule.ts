@@ -1,3 +1,5 @@
+export const FAILURE_RETRY_SECONDS = 10;
+
 export function nextScheduledTime(
   intervalSeconds: number,
   offsetSeconds: number,
@@ -12,6 +14,25 @@ export function nextScheduledTime(
   }
 
   return candidate;
+}
+
+export function nextCheckTime(
+  intervalSeconds: number,
+  offsetSeconds: number,
+  checkOk: boolean,
+  consecutiveFailures: number,
+  failureConfirmationChecks: number,
+  nowMs = Date.now(),
+): number {
+  if (
+    !checkOk &&
+    consecutiveFailures > 0 &&
+    consecutiveFailures < failureConfirmationChecks
+  ) {
+    return nowMs + FAILURE_RETRY_SECONDS * 1000;
+  }
+
+  return nextScheduledTime(intervalSeconds, offsetSeconds, nowMs);
 }
 
 export function randomOffsetSeconds(): number {
