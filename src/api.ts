@@ -294,10 +294,12 @@ async function getDashboard(env: Env, url: URL): Promise<Response> {
   const now = Date.now();
   const maxWindowDays = Math.max(...Object.values(DASHBOARD_WINDOWS));
   const cutoff = now - maxWindowDays * DAY_MS;
-  let incidents: DashboardIncident[] = [];
+  const incidents: DashboardIncident[] = [];
+  const incidentBatchSize = 50;
 
-  if (monitors.length) {
-    const placeholders = monitors.map(() => "?").join(",");
+  for (let index = 0; index < monitors.length; index += incidentBatchSize) {
+    const batch = monitors.slice(index, index + incidentBatchSize);
+    const placeholders = batch.map(() => "?").join(",");
     const result = await env.DB.prepare(
       `SELECT monitor_id, state, started_at, ended_at
       FROM monitor_incidents
@@ -305,10 +307,10 @@ async function getDashboard(env: Env, url: URL): Promise<Response> {
         AND started_at <= ?
         AND (ended_at IS NULL OR ended_at >= ?)
       ORDER BY started_at ASC`,
-    ).bind(...monitors.map((monitor) => monitor.id), now, cutoff)
+    ).bind(...batch.map((monitor) => monitor.id), now, cutoff)
       .all<DashboardIncident>();
 
-    incidents = result.results;
+    incidents.push(...result.results);
   }
 
   const incidentsByMonitor = new Map<string, DashboardIncident[]>();
