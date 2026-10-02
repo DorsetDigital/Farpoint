@@ -160,9 +160,12 @@ export class Monitor extends DurableObject<Env> {
         nextCheckTime(
           monitor.interval_seconds,
           monitor.offset_seconds,
+          monitor.current_state,
           result.ok,
           transition.counters.consecutiveFailures,
           monitor.failure_confirmation_checks,
+          transition.counters.consecutiveSuccesses,
+          monitor.recovery_confirmation_checks,
           Date.now(),
         ),
       );
