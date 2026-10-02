@@ -15,7 +15,7 @@ It runs on Cloudflare Workers, so the monitor is independent of the infrastructu
 - Tracks **UP**, **DEGRADED** and **DOWN** states.
 - Makes degraded monitoring optional per site with a configurable response-time threshold.
 - Confirms failures, degradation and recovery before changing state.
-- Sends Slack notifications only on meaningful state transitions.
+- Sends Slack notifications only on meaningful state transitions.\n- Keeps short-term raw checks plus compact hourly/daily reporting history and incidents.
 
 ## Requirements
 
@@ -86,7 +86,7 @@ POST   /api/v1/monitors
 GET    /api/v1/monitors/:id
 PATCH  /api/v1/monitors/:id
 DELETE /api/v1/monitors/:id
-GET    /api/v1/monitors/:id/results?limit=50
+GET    /api/v1/monitors/:id/results?limit=50\nGET    /api/v1/monitors/:id/stats?resolution=daily&days=365\nGET    /api/v1/monitors/:id/incidents?days=365
 ~~~
 
 `GET /health` is deliberately unauthenticated and reports only the health of the Farpoint Worker itself.
@@ -157,6 +157,34 @@ Durable Object alarms are used instead of a single cron fan-out. Each monitor ow
 The D1 database is the shared source of truth for configuration, current state and recent check results. Durable Object storage only needs to retain the monitor ID and its next alarm.
 
 Slack failures are logged but do not prevent the monitoring schedule from continuing.
+
+## History and retention
+
+Farpoint keeps detailed checks for a short window and compacts longer-term reporting data so a 12-month report does not require retaining every five-minute probe.
+
+Default retention is:
+
+~~~text
+Raw checks        30 days
+Hourly stats     365 days
+Daily stats     1825 days (5 years)
+Incidents       1825 days (5 years)
+~~~
+
+These are installation-level defaults, not hard-coded product assumptions. Override them in Worker configuration with:
+
+~~~text
+RAW_RETENTION_DAYS
+HOURLY_RETENTION_DAYS
+DAILY_RETENTION_DAYS
+INCIDENT_RETENTION_DAYS
+~~~
+
+Each setting must be a positive number of days. Missing, invalid or non-positive values fall back to the documented defaults; Farpoint deliberately has no magic "0 means forever" value.
+
+Hourly aggregates are updated as checks run. Once per day, each monitor rolls the completed day into a daily aggregate and applies retention cleanup. Open incidents are never removed by retention; the incident retention window applies only after an incident has ended.
+
+For long-range reporting, use daily stats. Hourly stats are useful for shorter-term detail, while raw results remain available for diagnostics inside the raw retention window.
 
 ## Status
 
