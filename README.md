@@ -15,7 +15,8 @@ It runs on Cloudflare Workers, so the monitor is independent of the infrastructu
 - Tracks **UP**, **DEGRADED** and **DOWN** states.
 - Makes degraded monitoring optional per site with a configurable response-time threshold.
 - Confirms failures, degradation and recovery before changing state.
-- Sends Slack notifications only on meaningful state transitions.\n- Keeps short-term raw checks plus compact hourly/daily reporting history and incidents.
+- Sends Slack notifications on first successful activation and meaningful state transitions.
+- Keeps short-term raw checks plus compact hourly/daily reporting history and incidents.
 
 ## Requirements
 
@@ -86,7 +87,9 @@ POST   /api/v1/monitors
 GET    /api/v1/monitors/:id
 PATCH  /api/v1/monitors/:id
 DELETE /api/v1/monitors/:id
-GET    /api/v1/monitors/:id/results?limit=50\nGET    /api/v1/monitors/:id/stats?resolution=daily&days=365\nGET    /api/v1/monitors/:id/incidents?days=365
+GET    /api/v1/monitors/:id/results?limit=50
+GET    /api/v1/monitors/:id/stats?resolution=daily&days=365
+GET    /api/v1/monitors/:id/incidents?days=365
 ~~~
 
 `GET /health` is deliberately unauthenticated and reports only the health of the Farpoint Worker itself.
@@ -124,7 +127,9 @@ Degraded monitoring is opt-in:
 
 Two consecutive HTML responses taking longer than three seconds would transition the site from `UP` to `DEGRADED` and send an orange Slack warning.
 
-A completely failed request is handled separately and transitions to `DOWN` after the configured failure confirmation count.
+A completely failed request is handled separately. While a failure is awaiting confirmation, Farpoint retries after 10 seconds rather than waiting for the normal monitoring interval. With the default failure confirmation count of 2, the second failed check can therefore confirm `DOWN` roughly 10 seconds after the first failure. Once downtime is confirmed, checks return to the normal monitoring interval.
+
+The first successful check also sends a one-off Slack confirmation — **Q-bot is watching** — so adding a monitor gives positive confirmation that Farpoint has actually checked it successfully.
 
 ## Cloudflare deployment
 
