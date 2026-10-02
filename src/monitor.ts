@@ -1,11 +1,20 @@
 import { DurableObject } from "cloudflare:workers";
 import { checkMonitor } from "./checker";
+import {
+  bucketStart,
+  DAY_MS,
+  pruneHistory,
+  recordHourlyAggregate,
+  recordIncidentTransition,
+  rollupCompletedDay,
+} from "./history";
 import { nextScheduledTime } from "./schedule";
 import { notifyStateChange } from "./slack";
 import { transitionState } from "./state";
 import type { Env, MonitorRow } from "./types";
 
 const MONITOR_ID_KEY = "monitorId";
+const LAST_MAINTENANCE_DAY_KEY = "lastMaintenanceDay";
 
 export class Monitor extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -35,6 +44,7 @@ export class Monitor extends DurableObject<Env> {
     if (request.method === "DELETE" && url.pathname === "/schedule") {
       await this.ctx.storage.deleteAlarm();
       await this.ctx.storage.delete(MONITOR_ID_KEY);
+      await this.ctx.storage.delete(LAST_MAINTENANCE_DAY_KEY);
       return new Response(null, { status: 204 });
     }
 
@@ -42,6 +52,8 @@ export class Monitor extends DurableObject<Env> {
       return Response.json({
         monitorId: await this.ctx.storage.get<string>(MONITOR_ID_KEY),
         alarm: await this.ctx.storage.getAlarm(),
+        lastMaintenanceDay:
+          await this.ctx.storage.get<number>(LAST_MAINTENANCE_DAY_KEY),
       });
     }
 
@@ -106,7 +118,25 @@ export class Monitor extends DurableObject<Env> {
         ),
       ]);
 
+      await recordHourlyAggregate(
+        this.env,
+        monitor.id,
+        checkedAt,
+        transition.state,
+        result.responseTimeMs,
+      );
+
       const stateChanged = transition.state !== monitor.current_state;
+
+      if (stateChanged) {
+        await recordIncidentTransition(
+          this.env,
+          monitor,
+          transition.state,
+          checkedAt,
+        );
+      }
+
       const initialHealthy =
         monitor.current_state === "UNKNOWN" && transition.state === "UP";
 
@@ -129,6 +159,8 @@ export class Monitor extends DurableObject<Env> {
         }
       }
 
+      await this.runDailyMaintenance(monitor.id, checkedAt);
+
       await this.ctx.storage.setAlarm(
         nextScheduledTime(
           monitor.interval_seconds,
@@ -142,6 +174,24 @@ export class Monitor extends DurableObject<Env> {
       // Keep the monitor alive even when D1 or another dependency has a transient issue.
       await this.ctx.storage.setAlarm(Date.now() + 60_000);
     }
+  }
+
+  private async runDailyMaintenance(
+    monitorId: string,
+    now: number,
+  ): Promise<void> {
+    const todayStart = bucketStart(now, DAY_MS);
+    const lastMaintenanceDay =
+      await this.ctx.storage.get<number>(LAST_MAINTENANCE_DAY_KEY);
+
+    if (lastMaintenanceDay === todayStart) {
+      return;
+    }
+
+    const yesterdayStart = todayStart - DAY_MS;
+    await rollupCompletedDay(this.env, monitorId, yesterdayStart);
+    await pruneHistory(this.env, monitorId, now);
+    await this.ctx.storage.put(LAST_MAINTENANCE_DAY_KEY, todayStart);
   }
 
   private async scheduleNext(monitorId: string): Promise<void> {
