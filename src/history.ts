@@ -7,8 +7,8 @@ export const DEFAULT_RETENTION_DAYS = {
   incidents: 1825,
 } as const;
 
-const DAY_MS = 86_400_000;
-const HOUR_MS = 3_600_000;
+export const DAY_MS = 86_400_000;
+export const HOUR_MS = 3_600_000;
 
 export function bucketStart(timestamp: number, bucketMs: number): number {
   return Math.floor(timestamp / bucketMs) * bucketMs;
@@ -22,16 +22,17 @@ export function retentionDays(
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function aggregateStatement(
+export async function recordHourlyAggregate(
   env: Env,
-  table: "monitor_hourly_stats" | "monitor_daily_stats",
   monitorId: string,
-  periodStart: number,
+  checkedAt: number,
   state: MonitorState,
   responseTimeMs: number,
-): D1PreparedStatement {
-  return env.DB.prepare(
-    `INSERT INTO ${table} (
+): Promise<void> {
+  const periodStart = bucketStart(checkedAt, HOUR_MS);
+
+  await env.DB.prepare(
+    `INSERT INTO monitor_hourly_stats (
       monitor_id, period_start, checks, up_checks, degraded_checks, down_checks,
       response_time_sum_ms, response_time_min_ms, response_time_max_ms
     ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
@@ -52,34 +53,43 @@ function aggregateStatement(
     responseTimeMs,
     responseTimeMs,
     responseTimeMs,
-  );
+  ).run();
 }
 
-export async function recordAggregates(
+export async function rollupCompletedDay(
   env: Env,
   monitorId: string,
-  checkedAt: number,
-  state: MonitorState,
-  responseTimeMs: number,
+  dayStart: number,
 ): Promise<void> {
-  await env.DB.batch([
-    aggregateStatement(
-      env,
-      "monitor_hourly_stats",
-      monitorId,
-      bucketStart(checkedAt, HOUR_MS),
-      state,
-      responseTimeMs,
-    ),
-    aggregateStatement(
-      env,
-      "monitor_daily_stats",
-      monitorId,
-      bucketStart(checkedAt, DAY_MS),
-      state,
-      responseTimeMs,
-    ),
-  ]);
+  const dayEnd = dayStart + DAY_MS;
+
+  await env.DB.prepare(
+    `INSERT INTO monitor_daily_stats (
+      monitor_id, period_start, checks, up_checks, degraded_checks, down_checks,
+      response_time_sum_ms, response_time_min_ms, response_time_max_ms
+    )
+    SELECT
+      monitor_id,
+      ?,
+      SUM(checks),
+      SUM(up_checks),
+      SUM(degraded_checks),
+      SUM(down_checks),
+      SUM(response_time_sum_ms),
+      MIN(response_time_min_ms),
+      MAX(response_time_max_ms)
+    FROM monitor_hourly_stats
+    WHERE monitor_id = ? AND period_start >= ? AND period_start < ?
+    GROUP BY monitor_id
+    ON CONFLICT (monitor_id, period_start) DO UPDATE SET
+      checks = excluded.checks,
+      up_checks = excluded.up_checks,
+      degraded_checks = excluded.degraded_checks,
+      down_checks = excluded.down_checks,
+      response_time_sum_ms = excluded.response_time_sum_ms,
+      response_time_min_ms = excluded.response_time_min_ms,
+      response_time_max_ms = excluded.response_time_max_ms`,
+  ).bind(dayStart, monitorId, dayStart, dayEnd).run();
 }
 
 export async function recordIncidentTransition(
