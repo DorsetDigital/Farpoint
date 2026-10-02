@@ -320,7 +320,7 @@ export async function handleApi(
 
     const result = await env.DB.prepare(
       "SELECT * FROM monitor_incidents " +
-        "WHERE monitor_id = ? AND (ended_at IS NULL OR started_at >= ?) " +
+        "WHERE monitor_id = ? AND (ended_at IS NULL OR ended_at >= ?) " +
         "ORDER BY started_at DESC",
     ).bind(id, cutoff).all();
 
