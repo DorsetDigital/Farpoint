@@ -263,20 +263,20 @@ export function dashboardPage(): Response {
           }
 
           byId("rows").innerHTML = data.monitors.length
-            ? data.monitors.map((monitor) => `
-              <tr>
-                <td>
-                  <div class="name">${escapeHtml(monitor.name)}</div>
-                  <div class="url">${escapeHtml(monitor.url)}</div>
-                </td>
-                <td><span class="pill ${monitor.state}">${monitor.state}</span></td>
-                <td>${fmtMs(monitor.response_time_ms)}</td>
-                <td>${fmtAge(monitor.last_checked_at)}</td>
-                <td>${fmtPercent(monitor.availability["24h"].uptime_percent)}</td>
-                <td>${fmtPercent(monitor.availability["7d"].uptime_percent)}</td>
-                <td>${fmtPercent(monitor.availability["30d"].uptime_percent)}</td>
-                <td>${fmtPercent(monitor.availability["24h"].degraded_percent)}</td>
-              </tr>`
+            ? data.monitors.map((monitor) =>
+              '<tr>' +
+                '<td>' +
+                  '<div class="name">' + escapeHtml(monitor.name) + '</div>' +
+                  '<div class="url">' + escapeHtml(monitor.url) + '</div>' +
+                '</td>' +
+                '<td><span class="pill ' + monitor.state + '">' + monitor.state + '</span></td>' +
+                '<td>' + fmtMs(monitor.response_time_ms) + '</td>' +
+                '<td>' + fmtAge(monitor.last_checked_at) + '</td>' +
+                '<td>' + fmtPercent(monitor.availability["24h"].uptime_percent) + '</td>' +
+                '<td>' + fmtPercent(monitor.availability["7d"].uptime_percent) + '</td>' +
+                '<td>' + fmtPercent(monitor.availability["30d"].uptime_percent) + '</td>' +
+                '<td>' + fmtPercent(monitor.availability["24h"].degraded_percent) + '</td>' +
+              '</tr>'
             ).join("")
             : '<tr><td colspan="8" class="muted">No monitors match these filters.</td></tr>';
 
