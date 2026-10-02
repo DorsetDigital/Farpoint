@@ -2,6 +2,7 @@ import { randomOffsetSeconds } from "./schedule";
 import type { Env, MonitorInput, MonitorRow } from "./types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
+const DAY_MS = 86_400_000;
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
@@ -41,6 +42,13 @@ function intInRange(
     value >= min &&
     value <= max
     ? value
+    : fallback;
+}
+
+function queryDays(url: URL, fallback = 365): number {
+  const value = Number.parseInt(url.searchParams.get("days") ?? "", 10);
+  return Number.isInteger(value) && value > 0
+    ? Math.min(value, 3650)
     : fallback;
 }
 
@@ -192,7 +200,7 @@ export async function handleApi(
   const url = new URL(request.url);
   const parts = url.pathname.split("/").filter(Boolean);
   const id = parts[3];
-  const isResults = parts[4] === "results";
+  const resource = parts[4];
 
   if (request.method === "GET" && parts.length === 3) {
     const result = await env.DB.prepare(
@@ -257,7 +265,7 @@ export async function handleApi(
     return json({ error: "Not found" }, 404);
   }
 
-  if (request.method === "GET" && isResults) {
+  if (request.method === "GET" && resource === "results") {
     const limit = Math.min(
       Math.max(Number.parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 1),
       500,
@@ -269,6 +277,54 @@ export async function handleApi(
     ).bind(id, limit).all();
 
     return json({ results: result.results });
+  }
+
+  if (request.method === "GET" && resource === "stats") {
+    const resolution = url.searchParams.get("resolution") ?? "daily";
+
+    if (resolution !== "hourly" && resolution !== "daily") {
+      return json({ error: "resolution must be hourly or daily" }, 400);
+    }
+
+    const days = queryDays(url);
+    const cutoff = Date.now() - days * DAY_MS;
+    const table =
+      resolution === "hourly"
+        ? "monitor_hourly_stats"
+        : "monitor_daily_stats";
+
+    const result = await env.DB.prepare(
+      `SELECT
+        period_start,
+        checks,
+        up_checks,
+        degraded_checks,
+        down_checks,
+        CASE
+          WHEN checks > 0 THEN response_time_sum_ms * 1.0 / checks
+          ELSE NULL
+        END AS response_time_avg_ms,
+        response_time_min_ms,
+        response_time_max_ms
+      FROM ${table}
+      WHERE monitor_id = ? AND period_start >= ?
+      ORDER BY period_start ASC`,
+    ).bind(id, cutoff).all();
+
+    return json({ resolution, days, stats: result.results });
+  }
+
+  if (request.method === "GET" && resource === "incidents") {
+    const days = queryDays(url);
+    const cutoff = Date.now() - days * DAY_MS;
+
+    const result = await env.DB.prepare(
+      "SELECT * FROM monitor_incidents " +
+        "WHERE monitor_id = ? AND (ended_at IS NULL OR started_at >= ?) " +
+        "ORDER BY started_at DESC",
+    ).bind(id, cutoff).all();
+
+    return json({ days, incidents: result.results });
   }
 
   if (request.method === "GET" && parts.length === 4) {
@@ -339,6 +395,9 @@ export async function handleApi(
     await stopMonitor(env, id);
     await env.DB.batch([
       env.DB.prepare("DELETE FROM monitor_results WHERE monitor_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM monitor_hourly_stats WHERE monitor_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM monitor_daily_stats WHERE monitor_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM monitor_incidents WHERE monitor_id = ?").bind(id),
       env.DB.prepare("DELETE FROM monitors WHERE id = ?").bind(id),
     ]);
 
