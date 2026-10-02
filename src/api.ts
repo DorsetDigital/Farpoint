@@ -1,3 +1,10 @@
+import {
+  calculateAvailability,
+  clampInt,
+  dashboardState,
+  DASHBOARD_WINDOWS,
+  type DashboardIncident,
+} from "./dashboard";
 import { randomOffsetSeconds } from "./schedule";
 import type { Env, MonitorInput, MonitorRow } from "./types";
 
@@ -189,6 +196,176 @@ async function getMonitor(env: Env, id: string): Promise<MonitorRow | null> {
     .first<MonitorRow>();
 }
 
+async function getDashboard(env: Env, url: URL): Promise<Response> {
+  const page = clampInt(url.searchParams.get("page"), 1, 1, 1_000_000);
+  const perPage = clampInt(url.searchParams.get("per_page"), 25, 1, 100);
+  const offset = (page - 1) * perPage;
+  const search = (url.searchParams.get("search") ?? "").trim();
+  const requestedState = url.searchParams.get("state");
+  const state = dashboardState(requestedState);
+  const enabled = url.searchParams.get("enabled") ?? "true";
+  const direction =
+    (url.searchParams.get("direction") ?? "asc").toLowerCase() === "desc"
+      ? "DESC"
+      : "ASC";
+
+  if (requestedState && !state) {
+    return json(
+      { error: "state must be UNKNOWN, UP, DEGRADED or DOWN" },
+      400,
+    );
+  }
+
+  if (!["true", "false", "all"].includes(enabled)) {
+    return json({ error: "enabled must be true, false or all" }, 400);
+  }
+
+  const sortColumns: Record<string, string> = {
+    name: "name COLLATE NOCASE",
+    state:
+      "CASE current_state " +
+      "WHEN 'DOWN' THEN 0 WHEN 'DEGRADED' THEN 1 " +
+      "WHEN 'UNKNOWN' THEN 2 ELSE 3 END",
+    response_time: "COALESCE(last_response_time_ms, -1)",
+    last_checked: "COALESCE(last_checked_at, 0)",
+  };
+  const sort =
+    sortColumns[url.searchParams.get("sort") ?? "name"] ?? sortColumns.name;
+
+  const where: string[] = [];
+  const bindings: unknown[] = [];
+
+  if (enabled !== "all") {
+    where.push("enabled = ?");
+    bindings.push(enabled === "true" ? 1 : 0);
+  }
+
+  if (state) {
+    where.push("current_state = ?");
+    bindings.push(state);
+  }
+
+  if (search) {
+    where.push("(name LIKE ? OR url LIKE ?)");
+    const term = "%" + search + "%";
+    bindings.push(term, term);
+  }
+
+  const whereSql = where.length ? " WHERE " + where.join(" AND ") : "";
+
+  const summaryWhere =
+    enabled === "all" ? "" : " WHERE enabled = ?";
+  const summaryBindings =
+    enabled === "all" ? [] : [enabled === "true" ? 1 : 0];
+
+  const [pageResult, countResult, summaryResult] = await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        id, name, url, enabled, current_state, interval_seconds,
+        degraded_enabled, degraded_threshold_ms,
+        last_checked_at, last_response_time_ms, last_status_code, last_error,
+        created_at
+      FROM monitors
+      ${whereSql}
+      ORDER BY ${sort} ${direction}, name COLLATE NOCASE ASC
+      LIMIT ? OFFSET ?`,
+    ).bind(...bindings, perPage, offset).all<MonitorRow>(),
+    env.DB.prepare(
+      "SELECT COUNT(*) AS total FROM monitors" + whereSql,
+    ).bind(...bindings).first<{ total: number }>(),
+    env.DB.prepare(
+      `SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN current_state = 'UP' THEN 1 ELSE 0 END) AS up,
+        SUM(CASE WHEN current_state = 'DEGRADED' THEN 1 ELSE 0 END) AS degraded,
+        SUM(CASE WHEN current_state = 'DOWN' THEN 1 ELSE 0 END) AS down,
+        SUM(CASE WHEN current_state = 'UNKNOWN' THEN 1 ELSE 0 END) AS unknown
+      FROM monitors` + summaryWhere,
+    ).bind(...summaryBindings).first<{
+      total: number;
+      up: number | null;
+      degraded: number | null;
+      down: number | null;
+      unknown: number | null;
+    }>(),
+  ]);
+
+  const monitors = pageResult.results;
+  const now = Date.now();
+  const maxWindowDays = Math.max(...Object.values(DASHBOARD_WINDOWS));
+  const cutoff = now - maxWindowDays * DAY_MS;
+  let incidents: DashboardIncident[] = [];
+
+  if (monitors.length) {
+    const placeholders = monitors.map(() => "?").join(",");
+    const result = await env.DB.prepare(
+      `SELECT monitor_id, state, started_at, ended_at
+      FROM monitor_incidents
+      WHERE monitor_id IN (${placeholders})
+        AND started_at <= ?
+        AND (ended_at IS NULL OR ended_at >= ?)
+      ORDER BY started_at ASC`,
+    ).bind(...monitors.map((monitor) => monitor.id), now, cutoff)
+      .all<DashboardIncident>();
+
+    incidents = result.results;
+  }
+
+  const incidentsByMonitor = new Map<string, DashboardIncident[]>();
+
+  for (const incident of incidents) {
+    const monitorIncidents = incidentsByMonitor.get(incident.monitor_id) ?? [];
+    monitorIncidents.push(incident);
+    incidentsByMonitor.set(incident.monitor_id, monitorIncidents);
+  }
+
+  const dashboardMonitors = monitors.map((monitor) => {
+    const monitorIncidents = incidentsByMonitor.get(monitor.id) ?? [];
+    const availability = Object.fromEntries(
+      Object.entries(DASHBOARD_WINDOWS).map(([label, days]) => [
+        label,
+        calculateAvailability(monitor.created_at, monitorIncidents, days, now),
+      ]),
+    );
+
+    return {
+      id: monitor.id,
+      name: monitor.name,
+      url: monitor.url,
+      enabled: monitor.enabled === 1,
+      state: monitor.current_state,
+      interval_seconds: monitor.interval_seconds,
+      degraded_enabled: monitor.degraded_enabled === 1,
+      degraded_threshold_ms: monitor.degraded_threshold_ms,
+      last_checked_at: monitor.last_checked_at,
+      response_time_ms: monitor.last_response_time_ms,
+      status_code: monitor.last_status_code,
+      error: monitor.last_error,
+      availability,
+    };
+  });
+
+  const total = countResult?.total ?? 0;
+
+  return json({
+    monitors: dashboardMonitors,
+    pagination: {
+      page,
+      per_page: perPage,
+      total,
+      pages: total === 0 ? 0 : Math.ceil(total / perPage),
+    },
+    summary: {
+      total: summaryResult?.total ?? 0,
+      up: summaryResult?.up ?? 0,
+      degraded: summaryResult?.degraded ?? 0,
+      down: summaryResult?.down ?? 0,
+      unknown: summaryResult?.unknown ?? 0,
+    },
+    generated_at: now,
+  });
+}
+
 export async function handleApi(
   request: Request,
   env: Env,
@@ -202,7 +379,19 @@ export async function handleApi(
   const id = parts[3];
   const resource = parts[4];
 
-  if (request.method === "GET" && parts.length === 3) {
+  if (
+    request.method === "GET" &&
+    parts.length === 3 &&
+    parts[2] === "dashboard"
+  ) {
+    return getDashboard(env, url);
+  }
+
+  if (
+    request.method === "GET" &&
+    parts.length === 3 &&
+    parts[2] === "monitors"
+  ) {
     const result = await env.DB.prepare(
       "SELECT * FROM monitors ORDER BY name ASC",
     ).all<MonitorRow>();
@@ -210,7 +399,11 @@ export async function handleApi(
     return json({ monitors: result.results });
   }
 
-  if (request.method === "POST" && parts.length === 3) {
+  if (
+    request.method === "POST" &&
+    parts.length === 3 &&
+    parts[2] === "monitors"
+  ) {
     try {
       const input = (await request.json()) as MonitorInput;
       const monitor = normaliseInput(input);
