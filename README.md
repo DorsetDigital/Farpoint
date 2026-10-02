@@ -82,6 +82,7 @@ Authorization: Bearer <API_KEY>
 Routes:
 
 ~~~text
+GET    /api/v1/dashboard?page=1&per_page=25
 GET    /api/v1/monitors
 POST   /api/v1/monitors
 GET    /api/v1/monitors/:id
@@ -93,6 +94,49 @@ GET    /api/v1/monitors/:id/incidents?days=365
 ~~~
 
 `GET /health` is deliberately unauthenticated and reports only the health of the Farpoint Worker itself.
+
+
+### Dashboard API
+
+`GET /api/v1/dashboard` is intended for control-panel overview screens and returns a paginated monitor list, current status counts and time-based availability for 24 hours, 7 days and 30 days.
+
+Supported query parameters:
+
+~~~text
+page=1
+per_page=25            # 1-100
+search=example         # matches monitor name or URL
+state=DOWN             # UNKNOWN, UP, DEGRADED or DOWN
+enabled=true           # true, false or all; defaults to true
+sort=name              # name, state, response_time or last_checked
+direction=asc          # asc or desc
+~~~
+
+The status summary covers the selected enabled population and is intentionally independent of the search/state filter, so the control panel can retain overall status counters while filtering the table.
+
+Availability is calculated from incident duration rather than check counts, so fast confirmation retries and different monitoring intervals do not distort uptime percentages. A monitor's denominator starts at its own creation time when it has less history than the requested window. Degraded duration is reported separately and does not count as downtime.
+
+Each dashboard monitor contains:
+
+~~~text
+id
+name
+url
+enabled
+state
+interval_seconds
+degraded_enabled
+degraded_threshold_ms
+last_checked_at
+response_time_ms
+status_code
+error
+availability.24h
+availability.7d
+availability.30d
+~~~
+
+Each availability window contains `uptime_percent`, `degraded_percent`, `down_ms`, `degraded_ms` and `observed_ms`.
 
 ## Optional content checks
 
