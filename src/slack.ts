@@ -15,10 +15,17 @@ export async function notifyStateChange(
     return;
   }
 
-  const emoji =
-    nextState === "DOWN" ? "🔴" : nextState === "DEGRADED" ? "🟠" : "🟢";
-  const title =
-    nextState === "DOWN"
+  const firstOnline = previousState === "UNKNOWN" && nextState === "UP";
+  const emoji = firstOnline
+    ? "👀"
+    : nextState === "DOWN"
+      ? "🔴"
+      : nextState === "DEGRADED"
+        ? "🟠"
+        : "🟢";
+  const title = firstOnline
+    ? "Q-bot is watching"
+    : nextState === "DOWN"
       ? "Website unavailable"
       : nextState === "DEGRADED"
         ? "Website performance degraded"
