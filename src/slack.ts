@@ -97,3 +97,60 @@ export async function notifyStateChange(
     );
   }
 }
+
+
+export async function notifyMonitoringServiceState(
+  env: Env,
+  paused: boolean,
+  total: number,
+  succeeded: number,
+  failed: number,
+): Promise<void> {
+  if (!env.SLACK_WEBHOOK_URL) {
+    return;
+  }
+
+  const emoji = paused ? "⏸️" : "👀";
+  const title = paused
+    ? "Farpoint service has been paused"
+    : "Farpoint service has resumed";
+  const message = paused
+    ? "Q is no longer watching!"
+    : "Q is watching again!";
+
+  const details = [
+    "*Monitors:* " + succeeded + "/" + total,
+  ];
+
+  if (failed > 0) {
+    details.push("*Failed:* " + failed);
+  }
+
+  const text =
+    emoji + " *" + title + "*\n" +
+    message + "\n" +
+    details.join("\n");
+
+  const response = await fetch(env.SLACK_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text: title + " — " + message,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text,
+          },
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      "Slack webhook returned HTTP " + response.status,
+    );
+  }
+}
