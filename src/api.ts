@@ -6,6 +6,7 @@ import {
   type DashboardIncident,
 } from "./dashboard";
 import { randomOffsetSeconds } from "./schedule";
+import { notifyMonitoringServiceState } from "./slack";
 import type { Env, MonitorInput, MonitorRow } from "./types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -461,6 +462,19 @@ export async function handleApi(
     parts[3] === "pause"
   ) {
     const result = await setMonitoringPaused(env, true);
+
+    try {
+      await notifyMonitoringServiceState(
+        env,
+        true,
+        result.total,
+        result.succeeded,
+        result.failed,
+      );
+    } catch (error) {
+      console.error("Slack service-state notification failed", error);
+    }
+
     return json({
       monitoring: "paused",
       ...result,
@@ -481,6 +495,19 @@ export async function handleApi(
     }
 
     const result = await setMonitoringPaused(env, false);
+
+    try {
+      await notifyMonitoringServiceState(
+        env,
+        false,
+        result.total,
+        result.succeeded,
+        result.failed,
+      );
+    } catch (error) {
+      console.error("Slack service-state notification failed", error);
+    }
+
     return json({
       monitoring: "running",
       ...result,
