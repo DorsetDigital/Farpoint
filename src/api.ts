@@ -80,6 +80,30 @@ async function stopMonitor(env: Env, monitorId: string): Promise<void> {
   await stub.fetch("https://farpoint.internal/schedule", { method: "DELETE" });
 }
 
+async function purgeMonitor(env: Env, monitorId: string): Promise<void> {
+  const id = env.MONITORS.idFromName(monitorId);
+  const stub = env.MONITORS.get(id);
+  await stub.fetch("https://farpoint.internal/purge", { method: "DELETE" });
+}
+
+async function getMonitorResults(
+  env: Env,
+  monitorId: string,
+  limit: number,
+): Promise<unknown> {
+  const id = env.MONITORS.idFromName(monitorId);
+  const stub = env.MONITORS.get(id);
+  const response = await stub.fetch(
+    "https://farpoint.internal/results?limit=" + limit,
+  );
+
+  if (!response.ok) {
+    throw new Error("Unable to read monitor results");
+  }
+
+  return response.json();
+}
+
 function normaliseInput(
   input: MonitorInput,
   existing?: MonitorRow,
@@ -466,12 +490,19 @@ export async function handleApi(
       500,
     );
 
-    const result = await env.DB.prepare(
-      "SELECT * FROM monitor_results WHERE monitor_id = ? " +
-        "ORDER BY checked_at DESC LIMIT ?",
-    ).bind(id, limit).all();
-
-    return json({ results: result.results });
+    try {
+      return json(await getMonitorResults(env, id, limit));
+    } catch (error) {
+      return json(
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to read monitor results",
+        },
+        502,
+      );
+    }
   }
 
   if (request.method === "GET" && resource === "stats") {
@@ -587,7 +618,7 @@ export async function handleApi(
       return new Response(null, { status: 204 });
     }
 
-    await stopMonitor(env, id);
+    await purgeMonitor(env, id);
     await env.DB.batch([
       env.DB.prepare("DELETE FROM monitor_results WHERE monitor_id = ?").bind(id),
       env.DB.prepare("DELETE FROM monitor_hourly_stats WHERE monitor_id = ?").bind(id),
