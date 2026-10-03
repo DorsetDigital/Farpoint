@@ -3,22 +3,89 @@ import { checkMonitor } from "./checker";
 import {
   bucketStart,
   DAY_MS,
+  DEFAULT_RETENTION_DAYS,
+  HOUR_MS,
   pruneHistory,
-  recordHourlyAggregate,
   recordIncidentTransition,
+  retentionDays,
   rollupCompletedDay,
+  writeHourlyAggregate,
+  type HourlyAggregate,
 } from "./history";
 import { nextCheckTime, nextScheduledTime } from "./schedule";
 import { notifyStateChange } from "./slack";
 import { transitionState } from "./state";
-import type { Env, MonitorRow } from "./types";
+import type { Env, MonitorRow, MonitorState } from "./types";
 
 const MONITOR_ID_KEY = "monitorId";
-const LAST_MAINTENANCE_DAY_KEY = "lastMaintenanceDay";
+const RUNTIME_KEY = "runtime";
+const D1_SNAPSHOT_INTERVAL_MS = 5 * 60_000;
+
+interface MonitorRuntime {
+  monitor: MonitorRow;
+  hourly: HourlyAggregate | null;
+  lastMaintenanceDay: number | null;
+  lastD1SnapshotAt: number | null;
+}
+
+function emptyHourly(periodStart: number): HourlyAggregate {
+  return {
+    periodStart,
+    checks: 0,
+    upChecks: 0,
+    degradedChecks: 0,
+    downChecks: 0,
+    responseTimeSumMs: 0,
+    responseTimeMinMs: null,
+    responseTimeMaxMs: null,
+  };
+}
+
+function addHourlyResult(
+  aggregate: HourlyAggregate,
+  state: MonitorState,
+  responseTimeMs: number,
+): HourlyAggregate {
+  return {
+    ...aggregate,
+    checks: aggregate.checks + 1,
+    upChecks: aggregate.upChecks + (state === "UP" ? 1 : 0),
+    degradedChecks:
+      aggregate.degradedChecks + (state === "DEGRADED" ? 1 : 0),
+    downChecks: aggregate.downChecks + (state === "DOWN" ? 1 : 0),
+    responseTimeSumMs: aggregate.responseTimeSumMs + responseTimeMs,
+    responseTimeMinMs:
+      aggregate.responseTimeMinMs === null
+        ? responseTimeMs
+        : Math.min(aggregate.responseTimeMinMs, responseTimeMs),
+    responseTimeMaxMs:
+      aggregate.responseTimeMaxMs === null
+        ? responseTimeMs
+        : Math.max(aggregate.responseTimeMaxMs, responseTimeMs),
+  };
+}
+
+function isCodeUpdateReset(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("Durable Object reset because its code was updated")
+  );
+}
 
 export class Monitor extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS recent_results (
+        checked_at INTEGER PRIMARY KEY,
+        state TEXT NOT NULL,
+        ok INTEGER NOT NULL,
+        status_code INTEGER,
+        response_time_ms INTEGER NOT NULL,
+        error TEXT
+      )
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -32,7 +99,15 @@ export class Monitor extends DurableObject<Env> {
       }
 
       await this.ctx.storage.put(MONITOR_ID_KEY, body.monitorId);
-      await this.scheduleNext(body.monitorId);
+
+      const runtime = await this.refreshRuntimeFromD1(body.monitorId);
+
+      if (!runtime || runtime.monitor.enabled !== 1) {
+        await this.ctx.storage.deleteAlarm();
+        return Response.json({ scheduled: false });
+      }
+
+      await this.scheduleNext(runtime.monitor);
       return Response.json({ scheduled: true });
     }
 
@@ -43,17 +118,41 @@ export class Monitor extends DurableObject<Env> {
 
     if (request.method === "DELETE" && url.pathname === "/schedule") {
       await this.ctx.storage.deleteAlarm();
-      await this.ctx.storage.delete(MONITOR_ID_KEY);
-      await this.ctx.storage.delete(LAST_MAINTENANCE_DAY_KEY);
       return new Response(null, { status: 204 });
     }
 
+    if (request.method === "DELETE" && url.pathname === "/purge") {
+      await this.ctx.storage.deleteAll();
+      return new Response(null, { status: 204 });
+    }
+
+    if (request.method === "GET" && url.pathname === "/results") {
+      const limit = Math.min(
+        Math.max(Number.parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 1),
+        500,
+      );
+
+      const results = this.ctx.storage.sql
+        .exec(
+          `SELECT checked_at, state, ok, status_code, response_time_ms, error
+           FROM recent_results
+           ORDER BY checked_at DESC
+           LIMIT ?`,
+          limit,
+        )
+        .toArray();
+
+      return Response.json({ results });
+    }
+
     if (request.method === "GET" && url.pathname === "/status") {
+      const runtime = await this.ctx.storage.get<MonitorRuntime>(RUNTIME_KEY);
+
       return Response.json({
         monitorId: await this.ctx.storage.get<string>(MONITOR_ID_KEY),
         alarm: await this.ctx.storage.getAlarm(),
-        lastMaintenanceDay:
-          await this.ctx.storage.get<number>(LAST_MAINTENANCE_DAY_KEY),
+        lastMaintenanceDay: runtime?.lastMaintenanceDay ?? null,
+        lastD1SnapshotAt: runtime?.lastD1SnapshotAt ?? null,
       });
     }
 
@@ -72,80 +171,68 @@ export class Monitor extends DurableObject<Env> {
     }
 
     try {
-      const monitor = await this.getMonitor(monitorId);
+      const runtime = await this.loadRuntime(monitorId);
 
-      if (!monitor || monitor.enabled !== 1) {
+      if (!runtime || runtime.monitor.enabled !== 1) {
         await this.ctx.storage.deleteAlarm();
         return;
       }
 
+      const monitor = runtime.monitor;
+      const previousState = monitor.current_state;
       const result = await checkMonitor(monitor);
       const transition = transitionState(monitor, result);
       const checkedAt = Date.now();
+      const currentHour = bucketStart(checkedAt, HOUR_MS);
 
-      await this.env.DB.batch([
-        this.env.DB.prepare(
-          "INSERT INTO monitor_results " +
-            "(monitor_id, checked_at, state, ok, status_code, response_time_ms, error) " +
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ).bind(
-          monitor.id,
-          checkedAt,
-          transition.state,
-          result.ok ? 1 : 0,
-          result.statusCode,
-          result.responseTimeMs,
-          result.error,
-        ),
-        this.env.DB.prepare(
-          "UPDATE monitors SET " +
-            "current_state = ?, consecutive_failures = ?, consecutive_slow = ?, " +
-            "consecutive_healthy = ?, consecutive_successes = ?, last_checked_at = ?, " +
-            "last_response_time_ms = ?, last_status_code = ?, last_error = ?, updated_at = ? " +
-            "WHERE id = ?",
-        ).bind(
-          transition.state,
-          transition.counters.consecutiveFailures,
-          transition.counters.consecutiveSlow,
-          transition.counters.consecutiveHealthy,
-          transition.counters.consecutiveSuccesses,
-          checkedAt,
-          result.responseTimeMs,
-          result.statusCode,
-          result.error,
-          checkedAt,
-          monitor.id,
-        ),
-      ]);
+      if (runtime.hourly && runtime.hourly.periodStart !== currentHour) {
+        await writeHourlyAggregate(this.env, monitor.id, runtime.hourly);
+        runtime.hourly = null;
+      }
 
-      await recordHourlyAggregate(
-        this.env,
-        monitor.id,
-        checkedAt,
+      runtime.hourly = addHourlyResult(
+        runtime.hourly ?? emptyHourly(currentHour),
         transition.state,
         result.responseTimeMs,
       );
 
-      const stateChanged = transition.state !== monitor.current_state;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO recent_results
+          (checked_at, state, ok, status_code, response_time_ms, error)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        checkedAt,
+        transition.state,
+        result.ok ? 1 : 0,
+        result.statusCode,
+        result.responseTimeMs,
+        result.error,
+      );
+
+      monitor.current_state = transition.state;
+      monitor.consecutive_failures = transition.counters.consecutiveFailures;
+      monitor.consecutive_slow = transition.counters.consecutiveSlow;
+      monitor.consecutive_healthy = transition.counters.consecutiveHealthy;
+      monitor.consecutive_successes = transition.counters.consecutiveSuccesses;
+      monitor.last_checked_at = checkedAt;
+      monitor.last_response_time_ms = result.responseTimeMs;
+      monitor.last_status_code = result.statusCode;
+      monitor.last_error = result.error;
+
+      const stateChanged = transition.state !== previousState;
 
       if (stateChanged) {
         await recordIncidentTransition(
           this.env,
-          monitor,
+          { id: monitor.id, current_state: previousState },
           transition.state,
           checkedAt,
         );
 
-        const refreshed = {
-          ...monitor,
-          current_state: transition.state,
-        } as MonitorRow;
-
         try {
           await notifyStateChange(
             this.env,
-            refreshed,
-            monitor.current_state,
+            monitor,
+            previousState,
             transition.state,
             result,
           );
@@ -154,13 +241,24 @@ export class Monitor extends DurableObject<Env> {
         }
       }
 
-      await this.runDailyMaintenance(monitor.id, checkedAt);
+      if (
+        stateChanged ||
+        runtime.lastD1SnapshotAt === null ||
+        checkedAt - runtime.lastD1SnapshotAt >= D1_SNAPSHOT_INTERVAL_MS
+      ) {
+        await this.writeD1Snapshot(monitor, checkedAt);
+        runtime.lastD1SnapshotAt = checkedAt;
+      }
+
+      await this.runDailyMaintenance(runtime, monitor.id, checkedAt);
+      runtime.monitor = monitor;
+      await this.ctx.storage.put(RUNTIME_KEY, runtime);
 
       await this.ctx.storage.setAlarm(
         nextCheckTime(
           monitor.interval_seconds,
           monitor.offset_seconds,
-          monitor.current_state,
+          previousState,
           result.ok,
           transition.counters.consecutiveFailures,
           monitor.failure_confirmation_checks,
@@ -170,39 +268,137 @@ export class Monitor extends DurableObject<Env> {
         ),
       );
     } catch (error) {
+      if (isCodeUpdateReset(error)) {
+        throw error;
+      }
+
       console.error("Monitor alarm failed", error);
 
-      // Keep the monitor alive even when D1 or another dependency has a transient issue.
+      // Keep the monitor alive when D1 or another dependency has a transient issue.
       await this.ctx.storage.setAlarm(Date.now() + 60_000);
     }
   }
 
+  private async loadRuntime(
+    monitorId: string,
+  ): Promise<MonitorRuntime | null> {
+    const existing = await this.ctx.storage.get<MonitorRuntime>(RUNTIME_KEY);
+
+    if (existing) {
+      return existing;
+    }
+
+    const monitor = await this.getMonitor(monitorId);
+
+    if (!monitor) {
+      return null;
+    }
+
+    const runtime: MonitorRuntime = {
+      monitor,
+      hourly: null,
+      lastMaintenanceDay: null,
+      lastD1SnapshotAt: monitor.last_checked_at,
+    };
+
+    await this.ctx.storage.put(RUNTIME_KEY, runtime);
+    return runtime;
+  }
+
+  private async refreshRuntimeFromD1(
+    monitorId: string,
+  ): Promise<MonitorRuntime | null> {
+    const fresh = await this.getMonitor(monitorId);
+
+    if (!fresh) {
+      return null;
+    }
+
+    const existing = await this.ctx.storage.get<MonitorRuntime>(RUNTIME_KEY);
+
+    if (existing) {
+      const live = existing.monitor;
+
+      fresh.current_state = live.current_state;
+      fresh.consecutive_failures = live.consecutive_failures;
+      fresh.consecutive_slow = live.consecutive_slow;
+      fresh.consecutive_healthy = live.consecutive_healthy;
+      fresh.consecutive_successes = live.consecutive_successes;
+      fresh.last_checked_at = live.last_checked_at;
+      fresh.last_response_time_ms = live.last_response_time_ms;
+      fresh.last_status_code = live.last_status_code;
+      fresh.last_error = live.last_error;
+
+      existing.monitor = fresh;
+      await this.ctx.storage.put(RUNTIME_KEY, existing);
+      return existing;
+    }
+
+    const runtime: MonitorRuntime = {
+      monitor: fresh,
+      hourly: null,
+      lastMaintenanceDay: null,
+      lastD1SnapshotAt: fresh.last_checked_at,
+    };
+
+    await this.ctx.storage.put(RUNTIME_KEY, runtime);
+    return runtime;
+  }
+
+  private async writeD1Snapshot(
+    monitor: MonitorRow,
+    checkedAt: number,
+  ): Promise<void> {
+    await this.env.DB.prepare(
+      "UPDATE monitors SET " +
+        "current_state = ?, consecutive_failures = ?, consecutive_slow = ?, " +
+        "consecutive_healthy = ?, consecutive_successes = ?, last_checked_at = ?, " +
+        "last_response_time_ms = ?, last_status_code = ?, last_error = ?, updated_at = ? " +
+        "WHERE id = ?",
+    ).bind(
+      monitor.current_state,
+      monitor.consecutive_failures,
+      monitor.consecutive_slow,
+      monitor.consecutive_healthy,
+      monitor.consecutive_successes,
+      monitor.last_checked_at,
+      monitor.last_response_time_ms,
+      monitor.last_status_code,
+      monitor.last_error,
+      checkedAt,
+      monitor.id,
+    ).run();
+  }
+
   private async runDailyMaintenance(
+    runtime: MonitorRuntime,
     monitorId: string,
     now: number,
   ): Promise<void> {
     const todayStart = bucketStart(now, DAY_MS);
-    const lastMaintenanceDay =
-      await this.ctx.storage.get<number>(LAST_MAINTENANCE_DAY_KEY);
 
-    if (lastMaintenanceDay === todayStart) {
+    if (runtime.lastMaintenanceDay === todayStart) {
       return;
     }
 
     const yesterdayStart = todayStart - DAY_MS;
     await rollupCompletedDay(this.env, monitorId, yesterdayStart);
     await pruneHistory(this.env, monitorId, now);
-    await this.ctx.storage.put(LAST_MAINTENANCE_DAY_KEY, todayStart);
+
+    const rawDays = retentionDays(
+      this.env.RAW_RETENTION_DAYS,
+      DEFAULT_RETENTION_DAYS.raw,
+    );
+
+    this.ctx.storage.sql.exec(
+      "DELETE FROM recent_results WHERE checked_at < ?",
+      now - rawDays * DAY_MS,
+    );
+
+    runtime.lastMaintenanceDay = todayStart;
   }
 
-  private async scheduleNext(monitorId: string): Promise<void> {
-    const monitor = await this.getMonitor(monitorId);
-
-    if (!monitor || monitor.enabled !== 1) {
-      await this.ctx.storage.deleteAlarm();
-      return;
-    }
-
+  private async scheduleNext(monitor: MonitorRow): Promise<void> {
     await this.ctx.storage.setAlarm(
       nextScheduledTime(
         monitor.interval_seconds,
