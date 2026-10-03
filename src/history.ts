@@ -22,37 +22,45 @@ export function retentionDays(
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-export async function recordHourlyAggregate(
+export interface HourlyAggregate {
+  periodStart: number;
+  checks: number;
+  upChecks: number;
+  degradedChecks: number;
+  downChecks: number;
+  responseTimeSumMs: number;
+  responseTimeMinMs: number | null;
+  responseTimeMaxMs: number | null;
+}
+
+export async function writeHourlyAggregate(
   env: Env,
   monitorId: string,
-  checkedAt: number,
-  state: MonitorState,
-  responseTimeMs: number,
+  aggregate: HourlyAggregate,
 ): Promise<void> {
-  const periodStart = bucketStart(checkedAt, HOUR_MS);
-
   await env.DB.prepare(
     `INSERT INTO monitor_hourly_stats (
       monitor_id, period_start, checks, up_checks, degraded_checks, down_checks,
       response_time_sum_ms, response_time_min_ms, response_time_max_ms
-    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (monitor_id, period_start) DO UPDATE SET
-      checks = checks + 1,
-      up_checks = up_checks + excluded.up_checks,
-      degraded_checks = degraded_checks + excluded.degraded_checks,
-      down_checks = down_checks + excluded.down_checks,
-      response_time_sum_ms = response_time_sum_ms + excluded.response_time_sum_ms,
-      response_time_min_ms = MIN(response_time_min_ms, excluded.response_time_min_ms),
-      response_time_max_ms = MAX(response_time_max_ms, excluded.response_time_max_ms)`,
+      checks = excluded.checks,
+      up_checks = excluded.up_checks,
+      degraded_checks = excluded.degraded_checks,
+      down_checks = excluded.down_checks,
+      response_time_sum_ms = excluded.response_time_sum_ms,
+      response_time_min_ms = excluded.response_time_min_ms,
+      response_time_max_ms = excluded.response_time_max_ms`,
   ).bind(
     monitorId,
-    periodStart,
-    state === "UP" ? 1 : 0,
-    state === "DEGRADED" ? 1 : 0,
-    state === "DOWN" ? 1 : 0,
-    responseTimeMs,
-    responseTimeMs,
-    responseTimeMs,
+    aggregate.periodStart,
+    aggregate.checks,
+    aggregate.upChecks,
+    aggregate.degradedChecks,
+    aggregate.downChecks,
+    aggregate.responseTimeSumMs,
+    aggregate.responseTimeMinMs,
+    aggregate.responseTimeMaxMs,
   ).run();
 }
 
