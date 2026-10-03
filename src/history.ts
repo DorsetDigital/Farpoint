@@ -120,15 +120,15 @@ export async function recordIncidentTransition(
       env.DB.prepare(
         "UPDATE monitor_incidents " +
           "SET ended_at = ?, duration_ms = ? - started_at " +
-          "WHERE monitor_id = ? AND ended_at IS NULL",
-      ).bind(changedAt, changedAt, monitor.id),
+          "WHERE monitor_id = ? AND ended_at IS NULL AND state = ?",
+      ).bind(changedAt, changedAt, monitor.id, monitor.current_state),
     );
   }
 
   if (nextState === "DEGRADED" || nextState === "DOWN") {
     statements.push(
       env.DB.prepare(
-        "INSERT INTO monitor_incidents " +
+        "INSERT OR IGNORE INTO monitor_incidents " +
           "(monitor_id, state, started_at) VALUES (?, ?, ?)",
       ).bind(monitor.id, nextState, changedAt),
     );
