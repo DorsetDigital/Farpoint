@@ -255,3 +255,36 @@ The prototype is deliberately self-contained HTML/CSS/JavaScript so the UI can b
 For the standalone Farpoint version, enter the API key in the page. It is kept only in browser memory and is not persisted. The page refreshes every 10 seconds and supports search, state filtering, sorting and pagination.
 
 The eventual Silverstripe integration should keep the same UI layer but replace the browser-side bearer-token fetch with a server-side proxy/controller, so the Farpoint API key never needs to be exposed to end users.
+
+
+## Storage architecture
+
+Farpoint separates operational monitor state from global reporting data.
+
+### Durable Object storage
+
+Each monitor Durable Object owns the hot-path state used for checking:
+
+- monitor configuration snapshot
+- current state and confirmation counters
+- latest check details
+- the in-progress hourly aggregate
+- recent raw check results
+
+Raw check results are stored in the Durable Object's SQLite database and are served through the existing `/api/v1/monitors/:id/results` endpoint.
+
+### D1
+
+D1 is used as the global configuration and reporting database:
+
+- monitor configuration
+- dashboard status snapshots
+- completed hourly aggregates
+- daily aggregates
+- incidents
+
+Healthy checks do not update D1 every minute. Live monitor state is snapshotted to D1 every five minutes, or immediately when the monitor state changes. Completed hourly aggregates are written once per hour.
+
+D1 reporting failures do not stop the monitoring loop. Pending hourly aggregates and incident transitions are retained in Durable Object state and retried after a five-minute reporting backoff.
+
+The legacy `monitor_results` D1 table is retained for existing historical data, but new raw results are no longer written there.
