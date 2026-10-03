@@ -86,6 +86,47 @@ async function purgeMonitor(env: Env, monitorId: string): Promise<void> {
   await stub.fetch("https://farpoint.internal/purge", { method: "DELETE" });
 }
 
+async function setMonitoringPaused(
+  env: Env,
+  paused: boolean,
+): Promise<{ total: number; succeeded: number; failed: number }> {
+  const result = await env.DB.prepare(
+    "SELECT id FROM monitors WHERE enabled = 1 ORDER BY id",
+  ).all<{ id: string }>();
+
+  let succeeded = 0;
+  let failed = 0;
+  const batchSize = 20;
+
+  for (let index = 0; index < result.results.length; index += batchSize) {
+    const batch = result.results.slice(index, index + batchSize);
+
+    const outcomes = await Promise.allSettled(
+      batch.map(async ({ id }) => {
+        if (paused) {
+          await stopMonitor(env, id);
+        } else {
+          await configureMonitor(env, id);
+        }
+      }),
+    );
+
+    for (const outcome of outcomes) {
+      if (outcome.status === "fulfilled") {
+        succeeded += 1;
+      } else {
+        failed += 1;
+      }
+    }
+  }
+
+  return {
+    total: result.results.length,
+    succeeded,
+    failed,
+  };
+}
+
 async function getMonitorResults(
   env: Env,
   monitorId: string,
@@ -411,6 +452,39 @@ export async function handleApi(
     parts[2] === "dashboard"
   ) {
     return getDashboard(env, url);
+  }
+
+  if (
+    request.method === "POST" &&
+    parts.length === 4 &&
+    parts[2] === "monitoring" &&
+    parts[3] === "pause"
+  ) {
+    const result = await setMonitoringPaused(env, true);
+    return json({
+      monitoring: "paused",
+      ...result,
+    }, result.failed === 0 ? 200 : 207);
+  }
+
+  if (
+    request.method === "POST" &&
+    parts.length === 4 &&
+    parts[2] === "monitoring" &&
+    parts[3] === "resume"
+  ) {
+    if (env.MONITORING_PAUSED === "true") {
+      return json({
+        error:
+          "Monitoring is paused by MONITORING_PAUSED configuration and cannot be resumed through the API",
+      }, 409);
+    }
+
+    const result = await setMonitoringPaused(env, false);
+    return json({
+      monitoring: "running",
+      ...result,
+    }, result.failed === 0 ? 200 : 207);
   }
 
   if (
