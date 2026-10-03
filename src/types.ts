@@ -6,6 +6,11 @@ export interface Env {
   API_KEY: string;
   SLACK_WEBHOOK_URL?: string;
   CONTROL_PANEL_BASE_URL?: string;
+  RAW_RETENTION_DAYS?: string;
+  HOURLY_RETENTION_DAYS?: string;
+  DAILY_RETENTION_DAYS?: string;
+  INCIDENT_RETENTION_DAYS?: string;
+  MONITORING_PAUSED?: string;
 }
 
 export interface MonitorRow {
