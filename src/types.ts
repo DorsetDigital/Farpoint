@@ -10,6 +10,7 @@ export interface Env {
   HOURLY_RETENTION_DAYS?: string;
   DAILY_RETENTION_DAYS?: string;
   INCIDENT_RETENTION_DAYS?: string;
+  MONITORING_PAUSED?: string;
 }
 
 export interface MonitorRow {
