@@ -171,6 +171,11 @@ export class Monitor extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (this.env.MONITORING_PAUSED === "true") {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
     await this.runCheck();
   }
 
