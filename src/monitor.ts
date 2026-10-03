@@ -20,12 +20,22 @@ import type { Env, MonitorRow, MonitorState } from "./types";
 const MONITOR_ID_KEY = "monitorId";
 const RUNTIME_KEY = "runtime";
 const D1_SNAPSHOT_INTERVAL_MS = 5 * 60_000;
+const REPORTING_RETRY_INTERVAL_MS = 5 * 60_000;
+
+interface PendingIncident {
+  previousState: MonitorState;
+  nextState: MonitorState;
+  changedAt: number;
+}
 
 interface MonitorRuntime {
   monitor: MonitorRow;
   hourly: HourlyAggregate | null;
+  pendingHourly: HourlyAggregate[];
+  pendingIncidents: PendingIncident[];
   lastMaintenanceDay: number | null;
   lastD1SnapshotAt: number | null;
+  nextReportingRetryAt: number | null;
 }
 
 function emptyHourly(periodStart: number): HourlyAggregate {
@@ -186,7 +196,7 @@ export class Monitor extends DurableObject<Env> {
       const currentHour = bucketStart(checkedAt, HOUR_MS);
 
       if (runtime.hourly && runtime.hourly.periodStart !== currentHour) {
-        await writeHourlyAggregate(this.env, monitor.id, runtime.hourly);
+        runtime.pendingHourly.push(runtime.hourly);
         runtime.hourly = null;
       }
 
@@ -221,12 +231,11 @@ export class Monitor extends DurableObject<Env> {
       const stateChanged = transition.state !== previousState;
 
       if (stateChanged) {
-        await recordIncidentTransition(
-          this.env,
-          { id: monitor.id, current_state: previousState },
-          transition.state,
-          checkedAt,
-        );
+        runtime.pendingIncidents.push({
+          previousState,
+          nextState: transition.state,
+          changedAt: checkedAt,
+        });
 
         try {
           await notifyStateChange(
@@ -241,16 +250,7 @@ export class Monitor extends DurableObject<Env> {
         }
       }
 
-      if (
-        stateChanged ||
-        runtime.lastD1SnapshotAt === null ||
-        checkedAt - runtime.lastD1SnapshotAt >= D1_SNAPSHOT_INTERVAL_MS
-      ) {
-        await this.writeD1Snapshot(monitor, checkedAt);
-        runtime.lastD1SnapshotAt = checkedAt;
-      }
-
-      await this.runDailyMaintenance(runtime, monitor.id, checkedAt);
+      await this.flushReporting(runtime, monitor, checkedAt, stateChanged);
       runtime.monitor = monitor;
       await this.ctx.storage.put(RUNTIME_KEY, runtime);
 
@@ -285,6 +285,9 @@ export class Monitor extends DurableObject<Env> {
     const existing = await this.ctx.storage.get<MonitorRuntime>(RUNTIME_KEY);
 
     if (existing) {
+      existing.pendingHourly ??= [];
+      existing.pendingIncidents ??= [];
+      existing.nextReportingRetryAt ??= null;
       return existing;
     }
 
@@ -297,8 +300,11 @@ export class Monitor extends DurableObject<Env> {
     const runtime: MonitorRuntime = {
       monitor,
       hourly: null,
+      pendingHourly: [],
+      pendingIncidents: [],
       lastMaintenanceDay: null,
       lastD1SnapshotAt: monitor.last_checked_at,
+      nextReportingRetryAt: null,
     };
 
     await this.ctx.storage.put(RUNTIME_KEY, runtime);
@@ -317,6 +323,10 @@ export class Monitor extends DurableObject<Env> {
     const existing = await this.ctx.storage.get<MonitorRuntime>(RUNTIME_KEY);
 
     if (existing) {
+      existing.pendingHourly ??= [];
+      existing.pendingIncidents ??= [];
+      existing.nextReportingRetryAt ??= null;
+
       const live = existing.monitor;
 
       fresh.current_state = live.current_state;
@@ -337,12 +347,75 @@ export class Monitor extends DurableObject<Env> {
     const runtime: MonitorRuntime = {
       monitor: fresh,
       hourly: null,
+      pendingHourly: [],
+      pendingIncidents: [],
       lastMaintenanceDay: null,
       lastD1SnapshotAt: fresh.last_checked_at,
+      nextReportingRetryAt: null,
     };
 
     await this.ctx.storage.put(RUNTIME_KEY, runtime);
     return runtime;
+  }
+
+  private async flushReporting(
+    runtime: MonitorRuntime,
+    monitor: MonitorRow,
+    now: number,
+    stateChanged: boolean,
+  ): Promise<void> {
+    if (
+      runtime.nextReportingRetryAt !== null &&
+      now < runtime.nextReportingRetryAt
+    ) {
+      return;
+    }
+
+    try {
+      while (runtime.pendingHourly.length) {
+        await writeHourlyAggregate(
+          this.env,
+          monitor.id,
+          runtime.pendingHourly[0],
+        );
+        runtime.pendingHourly.shift();
+      }
+
+      while (runtime.pendingIncidents.length) {
+        const incident = runtime.pendingIncidents[0];
+
+        await recordIncidentTransition(
+          this.env,
+          {
+            id: monitor.id,
+            current_state: incident.previousState,
+          },
+          incident.nextState,
+          incident.changedAt,
+        );
+
+        runtime.pendingIncidents.shift();
+      }
+
+      if (
+        stateChanged ||
+        runtime.lastD1SnapshotAt === null ||
+        now - runtime.lastD1SnapshotAt >= D1_SNAPSHOT_INTERVAL_MS
+      ) {
+        await this.writeD1Snapshot(monitor, now);
+        runtime.lastD1SnapshotAt = now;
+      }
+
+      await this.runDailyMaintenance(runtime, monitor.id, now);
+      runtime.nextReportingRetryAt = null;
+    } catch (error) {
+      if (isCodeUpdateReset(error)) {
+        throw error;
+      }
+
+      console.error("Monitor reporting sync failed", error);
+      runtime.nextReportingRetryAt = now + REPORTING_RETRY_INTERVAL_MS;
+    }
   }
 
   private async writeD1Snapshot(
