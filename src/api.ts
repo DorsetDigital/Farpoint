@@ -81,6 +81,30 @@ async function stopMonitor(env: Env, monitorId: string): Promise<void> {
   await stub.fetch("https://farpoint.internal/schedule", { method: "DELETE" });
 }
 
+async function pauseMonitor(env: Env, monitorId: string): Promise<void> {
+  const id = env.MONITORS.idFromName(monitorId);
+  const stub = env.MONITORS.get(id);
+  const response = await stub.fetch("https://farpoint.internal/pause", {
+    method: "POST",
+  });
+
+  if (!response.ok) {
+    throw new Error("Unable to pause monitor");
+  }
+}
+
+async function resumeMonitor(env: Env, monitorId: string): Promise<void> {
+  const id = env.MONITORS.idFromName(monitorId);
+  const stub = env.MONITORS.get(id);
+  const response = await stub.fetch("https://farpoint.internal/resume", {
+    method: "POST",
+  });
+
+  if (!response.ok) {
+    throw new Error("Unable to resume monitor");
+  }
+}
+
 async function purgeMonitor(env: Env, monitorId: string): Promise<void> {
   const id = env.MONITORS.idFromName(monitorId);
   const stub = env.MONITORS.get(id);
@@ -105,9 +129,9 @@ async function setMonitoringPaused(
     const outcomes = await Promise.allSettled(
       batch.map(async ({ id }) => {
         if (paused) {
-          await stopMonitor(env, id);
+          await pauseMonitor(env, id);
         } else {
-          await configureMonitor(env, id);
+          await resumeMonitor(env, id);
         }
       }),
     );
