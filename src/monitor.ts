@@ -19,6 +19,7 @@ import type { Env, MonitorRow, MonitorState } from "./types";
 
 const MONITOR_ID_KEY = "monitorId";
 const RUNTIME_KEY = "runtime";
+const PAUSED_KEY = "paused";
 const D1_SNAPSHOT_INTERVAL_MS = 5 * 60_000;
 const REPORTING_RETRY_INTERVAL_MS = 5 * 60_000;
 
@@ -111,6 +112,11 @@ export class Monitor extends DurableObject<Env> {
 
       await this.ctx.storage.put(MONITOR_ID_KEY, body.monitorId);
 
+      if (await this.ctx.storage.get<boolean>(PAUSED_KEY)) {
+        await this.ctx.storage.deleteAlarm();
+        return Response.json({ scheduled: false, paused: true });
+      }
+
       const runtime = await this.refreshRuntimeFromD1(body.monitorId);
 
       if (!runtime || runtime.monitor.enabled !== 1) {
@@ -120,6 +126,32 @@ export class Monitor extends DurableObject<Env> {
 
       await this.scheduleNext(runtime.monitor);
       return Response.json({ scheduled: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/pause") {
+      await this.ctx.storage.put(PAUSED_KEY, true);
+      await this.ctx.storage.deleteAlarm();
+      return Response.json({ paused: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/resume") {
+      await this.ctx.storage.put(PAUSED_KEY, false);
+
+      const monitorId = await this.ctx.storage.get<string>(MONITOR_ID_KEY);
+
+      if (!monitorId) {
+        return Response.json({ paused: false, scheduled: false });
+      }
+
+      const runtime = await this.refreshRuntimeFromD1(monitorId);
+
+      if (!runtime || runtime.monitor.enabled !== 1) {
+        await this.ctx.storage.deleteAlarm();
+        return Response.json({ paused: false, scheduled: false });
+      }
+
+      await this.scheduleNext(runtime.monitor);
+      return Response.json({ paused: false, scheduled: true });
     }
 
     if (request.method === "POST" && url.pathname === "/run") {
@@ -171,7 +203,10 @@ export class Monitor extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    if (this.env.MONITORING_PAUSED === "true") {
+    if (
+      this.env.MONITORING_PAUSED === "true" ||
+      (await this.ctx.storage.get<boolean>(PAUSED_KEY))
+    ) {
       await this.ctx.storage.deleteAlarm();
       return;
     }
