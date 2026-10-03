@@ -36,6 +36,7 @@ interface MonitorRuntime {
   lastMaintenanceDay: number | null;
   lastD1SnapshotAt: number | null;
   nextReportingRetryAt: number | null;
+  nextSnapshotRetryAt: number | null;
 }
 
 function emptyHourly(periodStart: number): HourlyAggregate {
@@ -250,7 +251,8 @@ export class Monitor extends DurableObject<Env> {
         }
       }
 
-      await this.flushReporting(runtime, monitor, checkedAt, stateChanged);
+      await this.flushStatusSnapshot(runtime, monitor, checkedAt, stateChanged);
+      await this.flushReporting(runtime, monitor, checkedAt);
       runtime.monitor = monitor;
       await this.ctx.storage.put(RUNTIME_KEY, runtime);
 
@@ -288,6 +290,7 @@ export class Monitor extends DurableObject<Env> {
       existing.pendingHourly ??= [];
       existing.pendingIncidents ??= [];
       existing.nextReportingRetryAt ??= null;
+      existing.nextSnapshotRetryAt ??= null;
       return existing;
     }
 
@@ -305,6 +308,7 @@ export class Monitor extends DurableObject<Env> {
       lastMaintenanceDay: null,
       lastD1SnapshotAt: monitor.last_checked_at,
       nextReportingRetryAt: null,
+      nextSnapshotRetryAt: null,
     };
 
     await this.ctx.storage.put(RUNTIME_KEY, runtime);
@@ -326,6 +330,7 @@ export class Monitor extends DurableObject<Env> {
       existing.pendingHourly ??= [];
       existing.pendingIncidents ??= [];
       existing.nextReportingRetryAt ??= null;
+      existing.nextSnapshotRetryAt ??= null;
 
       const live = existing.monitor;
 
@@ -352,17 +357,54 @@ export class Monitor extends DurableObject<Env> {
       lastMaintenanceDay: null,
       lastD1SnapshotAt: fresh.last_checked_at,
       nextReportingRetryAt: null,
+      nextSnapshotRetryAt: null,
     };
 
     await this.ctx.storage.put(RUNTIME_KEY, runtime);
     return runtime;
   }
 
-  private async flushReporting(
+  private async flushStatusSnapshot(
     runtime: MonitorRuntime,
     monitor: MonitorRow,
     now: number,
     stateChanged: boolean,
+  ): Promise<void> {
+    const snapshotDue =
+      stateChanged ||
+      runtime.lastD1SnapshotAt === null ||
+      now - runtime.lastD1SnapshotAt >= D1_SNAPSHOT_INTERVAL_MS;
+
+    if (!snapshotDue) {
+      return;
+    }
+
+    if (
+      !stateChanged &&
+      runtime.nextSnapshotRetryAt !== null &&
+      now < runtime.nextSnapshotRetryAt
+    ) {
+      return;
+    }
+
+    try {
+      await this.writeD1Snapshot(monitor, now);
+      runtime.lastD1SnapshotAt = now;
+      runtime.nextSnapshotRetryAt = null;
+    } catch (error) {
+      if (isCodeUpdateReset(error)) {
+        throw error;
+      }
+
+      console.error("Monitor status snapshot failed", error);
+      runtime.nextSnapshotRetryAt = now + REPORTING_RETRY_INTERVAL_MS;
+    }
+  }
+
+  private async flushReporting(
+    runtime: MonitorRuntime,
+    monitor: MonitorRow,
+    now: number,
   ): Promise<void> {
     if (
       runtime.nextReportingRetryAt !== null &&
@@ -395,15 +437,6 @@ export class Monitor extends DurableObject<Env> {
         );
 
         runtime.pendingIncidents.shift();
-      }
-
-      if (
-        stateChanged ||
-        runtime.lastD1SnapshotAt === null ||
-        now - runtime.lastD1SnapshotAt >= D1_SNAPSHOT_INTERVAL_MS
-      ) {
-        await this.writeD1Snapshot(monitor, now);
-        runtime.lastD1SnapshotAt = now;
       }
 
       await this.runDailyMaintenance(runtime, monitor.id, now);
