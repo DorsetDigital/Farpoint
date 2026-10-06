@@ -179,7 +179,21 @@ The first successful check also sends a one-off Slack confirmation — **Q-bot i
 
 ## Cloudflare deployment
 
-The D1 binding intentionally omits a database ID. Wrangler can provision the D1 resource during the first deployment and write the generated ID into the local configuration.
+The tracked `wrangler.jsonc` intentionally contains only portable configuration.
+The production D1 database ID is kept in a separate, git-ignored local file so
+pulling repository changes never conflicts with environment-specific resource IDs
+and the database ID cannot be committed accidentally.
+
+Create the local deployment configuration once:
+
+~~~bash
+cp .farpoint.local.example.json .farpoint.local.json
+~~~
+
+Then edit `.farpoint.local.json` and set the existing production D1 database ID.
+`npm run deploy` and `npm run db:migrate:remote` automatically generate a
+temporary `.wrangler.generated.jsonc` from the tracked configuration plus that
+local ID. Both local/generated files are ignored by Git.
 
 Set production secrets before enabling real monitors:
 
@@ -188,11 +202,12 @@ npx wrangler secret put API_KEY
 npx wrangler secret put SLACK_WEBHOOK_URL
 ~~~
 
-Then deploy and apply the D1 migration:
+For an upgrade which includes D1 migrations, apply the additive migration before
+deploying the Worker:
 
 ~~~bash
-npm run deploy
 npm run db:migrate:remote
+npm run deploy
 ~~~
 
 Run the checks locally before deployment:
