@@ -4,3 +4,7 @@ node_modules/
 dist/
 coverage/
 *.log
+
+# Local deployment configuration (contains Cloudflare resource IDs)
+.farpoint.local.json
+.wrangler.generated.jsonc
