@@ -24,7 +24,7 @@ export async function notifyStateChange(
         ? "🟠"
         : "🟢";
   const title = firstOnline
-    ? "Q-bot is watching"
+    ? "Q is watching"
     : nextState === "DOWN"
       ? "Website unavailable"
       : nextState === "DEGRADED"
