@@ -4,6 +4,7 @@ node_modules/
 dist/
 coverage/
 *.log
+.idea
 
 # Local deployment configuration (contains Cloudflare resource IDs)
 .farpoint.local.json
