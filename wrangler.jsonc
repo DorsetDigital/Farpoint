@@ -25,6 +25,11 @@
     }
   },
   "vars": {
-    "CONTROL_PANEL_BASE_URL": ""
+    "CONTROL_PANEL_BASE_URL": "",
+    "RAW_RETENTION_DAYS": "30",
+    "HOURLY_RETENTION_DAYS": "365",
+    "DAILY_RETENTION_DAYS": "1825",
+    "INCIDENT_RETENTION_DAYS": "1825",
+    "MONITORING_PAUSED": "true"
   }
 }

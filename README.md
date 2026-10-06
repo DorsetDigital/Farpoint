@@ -15,7 +15,8 @@ It runs on Cloudflare Workers, so the monitor is independent of the infrastructu
 - Tracks **UP**, **DEGRADED** and **DOWN** states.
 - Makes degraded monitoring optional per site with a configurable response-time threshold.
 - Confirms failures, degradation and recovery before changing state.
-- Sends Slack notifications only on meaningful state transitions.
+- Sends Slack notifications on first successful activation and meaningful state transitions.
+- Keeps short-term raw checks plus compact hourly/daily reporting history and incidents.
 
 ## Requirements
 
@@ -81,15 +82,61 @@ Authorization: Bearer <API_KEY>
 Routes:
 
 ~~~text
+GET    /api/v1/dashboard?page=1&per_page=25
 GET    /api/v1/monitors
 POST   /api/v1/monitors
 GET    /api/v1/monitors/:id
 PATCH  /api/v1/monitors/:id
 DELETE /api/v1/monitors/:id
 GET    /api/v1/monitors/:id/results?limit=50
+GET    /api/v1/monitors/:id/stats?resolution=daily&days=365
+GET    /api/v1/monitors/:id/incidents?days=365
 ~~~
 
 `GET /health` is deliberately unauthenticated and reports only the health of the Farpoint Worker itself.
+
+
+### Dashboard API
+
+`GET /api/v1/dashboard` is intended for control-panel overview screens and returns a paginated monitor list, current status counts and time-based availability for 24 hours, 7 days and 30 days.
+
+Supported query parameters:
+
+~~~text
+page=1
+per_page=25            # 1-100
+search=example         # matches monitor name or URL
+state=DOWN             # UNKNOWN, UP, DEGRADED or DOWN
+enabled=true           # true, false or all; defaults to true
+sort=name              # name, state, response_time or last_checked
+direction=asc          # asc or desc
+~~~
+
+The status summary covers the selected enabled population and is intentionally independent of the search/state filter, so the control panel can retain overall status counters while filtering the table.
+
+Availability is calculated from incident duration rather than check counts, so fast confirmation retries and different monitoring intervals do not distort uptime percentages. A monitor's denominator starts at its own creation time when it has less history than the requested window. Degraded duration is reported separately and does not count as downtime.
+
+Each dashboard monitor contains:
+
+~~~text
+id
+name
+url
+enabled
+state
+interval_seconds
+degraded_enabled
+degraded_threshold_ms
+last_checked_at
+response_time_ms
+status_code
+error
+availability.24h
+availability.7d
+availability.30d
+~~~
+
+Each availability window contains `uptime_percent`, `degraded_percent`, `down_ms`, `degraded_ms` and `observed_ms`.
 
 ## Optional content checks
 
@@ -124,7 +171,11 @@ Degraded monitoring is opt-in:
 
 Two consecutive HTML responses taking longer than three seconds would transition the site from `UP` to `DEGRADED` and send an orange Slack warning.
 
-A completely failed request is handled separately and transitions to `DOWN` after the configured failure confirmation count.
+A completely failed request is handled separately. While a failure is awaiting confirmation, Farpoint retries after 10 seconds rather than waiting for the normal monitoring interval. With the default failure confirmation count of 2, the second failed check can therefore confirm `DOWN` roughly 10 seconds after the first failure. Once downtime is confirmed, checks return to the normal monitoring interval.
+
+Recovery uses the same fast-confirmation approach. When a `DOWN` monitor first succeeds, Farpoint retries after 10 seconds until the configured recovery confirmation count is reached. Once recovery is confirmed, the monitor returns to its normal cadence.
+
+The first successful check also sends a one-off Slack confirmation — **Q-bot is watching** — so adding a monitor gives positive confirmation that Farpoint has actually checked it successfully.
 
 ## Cloudflare deployment
 
@@ -158,6 +209,82 @@ The D1 database is the shared source of truth for configuration, current state a
 
 Slack failures are logged but do not prevent the monitoring schedule from continuing.
 
+## History and retention
+
+Farpoint keeps detailed checks for a short window and compacts longer-term reporting data so a 12-month report does not require retaining every five-minute probe.
+
+Default retention is:
+
+~~~text
+Raw checks        30 days
+Hourly stats     365 days
+Daily stats     1825 days (5 years)
+Incidents       1825 days (5 years)
+~~~
+
+These are installation-level defaults, not hard-coded product assumptions. Override them in Worker configuration with:
+
+~~~text
+RAW_RETENTION_DAYS
+HOURLY_RETENTION_DAYS
+DAILY_RETENTION_DAYS
+INCIDENT_RETENTION_DAYS
+~~~
+
+Each setting must be a positive number of days. Missing, invalid or non-positive values fall back to the documented defaults; Farpoint deliberately has no magic "0 means forever" value.
+
+Hourly aggregates are updated as checks run. Once per day, each monitor rolls the completed day into a daily aggregate and applies retention cleanup. Open incidents are never removed by retention; the incident retention window applies only after an incident has ended.
+
+For long-range reporting, use daily stats. Hourly stats are useful for shorter-term detail, while raw results remain available for diagnostics inside the raw retention window.
+
 ## Status
 
 This repository is currently a proof of concept. The next useful steps are a real Cloudflare deployment, a small parallel pilot alongside the existing uptime service, and then control-panel integration.
+
+
+## HTML dashboard
+
+Farpoint includes a lightweight operator dashboard at:
+
+~~~text
+/dashboard
+~~~
+
+The prototype is deliberately self-contained HTML/CSS/JavaScript so the UI can be reused later inside the Silverstripe control panel.
+
+For the standalone Farpoint version, enter the API key in the page. It is kept only in browser memory and is not persisted. The page refreshes every 10 seconds and supports search, state filtering, sorting and pagination.
+
+The eventual Silverstripe integration should keep the same UI layer but replace the browser-side bearer-token fetch with a server-side proxy/controller, so the Farpoint API key never needs to be exposed to end users.
+
+
+## Storage architecture
+
+Farpoint separates operational monitor state from global reporting data.
+
+### Durable Object storage
+
+Each monitor Durable Object owns the hot-path state used for checking:
+
+- monitor configuration snapshot
+- current state and confirmation counters
+- latest check details
+- the in-progress hourly aggregate
+- recent raw check results
+
+Raw check results are stored in the Durable Object's SQLite database and are served through the existing `/api/v1/monitors/:id/results` endpoint.
+
+### D1
+
+D1 is used as the global configuration and reporting database:
+
+- monitor configuration
+- dashboard status snapshots
+- completed hourly aggregates
+- daily aggregates
+- incidents
+
+Healthy checks do not update D1 every minute. Live monitor state is snapshotted to D1 every five minutes, or immediately when the monitor state changes. Completed hourly aggregates are written once per hour.
+
+D1 reporting failures do not stop the monitoring loop. Pending hourly aggregates and incident transitions are retained in Durable Object state and retried after a five-minute reporting backoff.
+
+The legacy `monitor_results` D1 table is retained for existing historical data, but new raw results are no longer written there.

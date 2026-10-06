@@ -1,7 +1,16 @@
+import {
+  calculateAvailability,
+  clampInt,
+  dashboardState,
+  DASHBOARD_WINDOWS,
+  type DashboardIncident,
+} from "./dashboard";
 import { randomOffsetSeconds } from "./schedule";
+import { notifyMonitoringServiceState } from "./slack";
 import type { Env, MonitorInput, MonitorRow } from "./types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
+const DAY_MS = 86_400_000;
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
@@ -44,6 +53,13 @@ function intInRange(
     : fallback;
 }
 
+function queryDays(url: URL, fallback = 365): number {
+  const value = Number.parseInt(url.searchParams.get("days") ?? "", 10);
+  return Number.isInteger(value) && value > 0
+    ? Math.min(value, 3650)
+    : fallback;
+}
+
 async function configureMonitor(env: Env, monitorId: string): Promise<void> {
   const id = env.MONITORS.idFromName(monitorId);
   const stub = env.MONITORS.get(id);
@@ -63,6 +79,95 @@ async function stopMonitor(env: Env, monitorId: string): Promise<void> {
   const id = env.MONITORS.idFromName(monitorId);
   const stub = env.MONITORS.get(id);
   await stub.fetch("https://farpoint.internal/schedule", { method: "DELETE" });
+}
+
+async function pauseMonitor(env: Env, monitorId: string): Promise<void> {
+  const id = env.MONITORS.idFromName(monitorId);
+  const stub = env.MONITORS.get(id);
+  const response = await stub.fetch("https://farpoint.internal/pause", {
+    method: "POST",
+  });
+
+  if (!response.ok) {
+    throw new Error("Unable to pause monitor");
+  }
+}
+
+async function resumeMonitor(env: Env, monitorId: string): Promise<void> {
+  const id = env.MONITORS.idFromName(monitorId);
+  const stub = env.MONITORS.get(id);
+  const response = await stub.fetch("https://farpoint.internal/resume", {
+    method: "POST",
+  });
+
+  if (!response.ok) {
+    throw new Error("Unable to resume monitor");
+  }
+}
+
+async function purgeMonitor(env: Env, monitorId: string): Promise<void> {
+  const id = env.MONITORS.idFromName(monitorId);
+  const stub = env.MONITORS.get(id);
+  await stub.fetch("https://farpoint.internal/purge", { method: "DELETE" });
+}
+
+async function setMonitoringPaused(
+  env: Env,
+  paused: boolean,
+): Promise<{ total: number; succeeded: number; failed: number }> {
+  const result = await env.DB.prepare(
+    "SELECT id FROM monitors WHERE enabled = 1 ORDER BY id",
+  ).all<{ id: string }>();
+
+  let succeeded = 0;
+  let failed = 0;
+  const batchSize = 20;
+
+  for (let index = 0; index < result.results.length; index += batchSize) {
+    const batch = result.results.slice(index, index + batchSize);
+
+    const outcomes = await Promise.allSettled(
+      batch.map(async ({ id }) => {
+        if (paused) {
+          await pauseMonitor(env, id);
+        } else {
+          await resumeMonitor(env, id);
+        }
+      }),
+    );
+
+    for (const outcome of outcomes) {
+      if (outcome.status === "fulfilled") {
+        succeeded += 1;
+      } else {
+        failed += 1;
+      }
+    }
+  }
+
+  return {
+    total: result.results.length,
+    succeeded,
+    failed,
+  };
+}
+
+async function getMonitorResults(
+  env: Env,
+  monitorId: string,
+  limit: number,
+): Promise<unknown> {
+  const id = env.MONITORS.idFromName(monitorId);
+  const stub = env.MONITORS.get(id);
+  const response = await stub.fetch(
+    "https://farpoint.internal/results?limit=" + limit,
+  );
+
+  if (!response.ok) {
+    throw new Error("Unable to read monitor results");
+  }
+
+  return response.json();
 }
 
 function normaliseInput(
@@ -181,6 +286,178 @@ async function getMonitor(env: Env, id: string): Promise<MonitorRow | null> {
     .first<MonitorRow>();
 }
 
+async function getDashboard(env: Env, url: URL): Promise<Response> {
+  const page = clampInt(url.searchParams.get("page"), 1, 1, 1_000_000);
+  const perPage = clampInt(url.searchParams.get("per_page"), 25, 1, 100);
+  const offset = (page - 1) * perPage;
+  const search = (url.searchParams.get("search") ?? "").trim();
+  const requestedState = url.searchParams.get("state");
+  const state = dashboardState(requestedState);
+  const enabled = url.searchParams.get("enabled") ?? "true";
+  const direction =
+    (url.searchParams.get("direction") ?? "asc").toLowerCase() === "desc"
+      ? "DESC"
+      : "ASC";
+
+  if (requestedState && !state) {
+    return json(
+      { error: "state must be UNKNOWN, UP, DEGRADED or DOWN" },
+      400,
+    );
+  }
+
+  if (!["true", "false", "all"].includes(enabled)) {
+    return json({ error: "enabled must be true, false or all" }, 400);
+  }
+
+  const sortColumns: Record<string, string> = {
+    name: "name COLLATE NOCASE",
+    state:
+      "CASE current_state " +
+      "WHEN 'DOWN' THEN 0 WHEN 'DEGRADED' THEN 1 " +
+      "WHEN 'UNKNOWN' THEN 2 ELSE 3 END",
+    response_time: "COALESCE(last_response_time_ms, -1)",
+    last_checked: "COALESCE(last_checked_at, 0)",
+  };
+  const sort =
+    sortColumns[url.searchParams.get("sort") ?? "name"] ?? sortColumns.name;
+
+  const where: string[] = [];
+  const bindings: unknown[] = [];
+
+  if (enabled !== "all") {
+    where.push("enabled = ?");
+    bindings.push(enabled === "true" ? 1 : 0);
+  }
+
+  if (state) {
+    where.push("current_state = ?");
+    bindings.push(state);
+  }
+
+  if (search) {
+    where.push("(name LIKE ? OR url LIKE ?)");
+    const term = "%" + search + "%";
+    bindings.push(term, term);
+  }
+
+  const whereSql = where.length ? " WHERE " + where.join(" AND ") : "";
+
+  const summaryWhere =
+    enabled === "all" ? "" : " WHERE enabled = ?";
+  const summaryBindings =
+    enabled === "all" ? [] : [enabled === "true" ? 1 : 0];
+
+  const [pageResult, countResult, summaryResult] = await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        id, name, url, enabled, current_state, interval_seconds,
+        degraded_enabled, degraded_threshold_ms,
+        last_checked_at, last_response_time_ms, last_status_code, last_error,
+        created_at
+      FROM monitors
+      ${whereSql}
+      ORDER BY ${sort} ${direction}, name COLLATE NOCASE ASC
+      LIMIT ? OFFSET ?`,
+    ).bind(...bindings, perPage, offset).all<MonitorRow>(),
+    env.DB.prepare(
+      "SELECT COUNT(*) AS total FROM monitors" + whereSql,
+    ).bind(...bindings).first<{ total: number }>(),
+    env.DB.prepare(
+      `SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN current_state = 'UP' THEN 1 ELSE 0 END) AS up,
+        SUM(CASE WHEN current_state = 'DEGRADED' THEN 1 ELSE 0 END) AS degraded,
+        SUM(CASE WHEN current_state = 'DOWN' THEN 1 ELSE 0 END) AS down,
+        SUM(CASE WHEN current_state = 'UNKNOWN' THEN 1 ELSE 0 END) AS unknown
+      FROM monitors` + summaryWhere,
+    ).bind(...summaryBindings).first<{
+      total: number;
+      up: number | null;
+      degraded: number | null;
+      down: number | null;
+      unknown: number | null;
+    }>(),
+  ]);
+
+  const monitors = pageResult.results;
+  const now = Date.now();
+  const maxWindowDays = Math.max(...Object.values(DASHBOARD_WINDOWS));
+  const cutoff = now - maxWindowDays * DAY_MS;
+  const incidents: DashboardIncident[] = [];
+  const incidentBatchSize = 50;
+
+  for (let index = 0; index < monitors.length; index += incidentBatchSize) {
+    const batch = monitors.slice(index, index + incidentBatchSize);
+    const placeholders = batch.map(() => "?").join(",");
+    const result = await env.DB.prepare(
+      `SELECT monitor_id, state, started_at, ended_at
+      FROM monitor_incidents
+      WHERE monitor_id IN (${placeholders})
+        AND started_at <= ?
+        AND (ended_at IS NULL OR ended_at >= ?)
+      ORDER BY started_at ASC`,
+    ).bind(...batch.map((monitor) => monitor.id), now, cutoff)
+      .all<DashboardIncident>();
+
+    incidents.push(...result.results);
+  }
+
+  const incidentsByMonitor = new Map<string, DashboardIncident[]>();
+
+  for (const incident of incidents) {
+    const monitorIncidents = incidentsByMonitor.get(incident.monitor_id) ?? [];
+    monitorIncidents.push(incident);
+    incidentsByMonitor.set(incident.monitor_id, monitorIncidents);
+  }
+
+  const dashboardMonitors = monitors.map((monitor) => {
+    const monitorIncidents = incidentsByMonitor.get(monitor.id) ?? [];
+    const availability = Object.fromEntries(
+      Object.entries(DASHBOARD_WINDOWS).map(([label, days]) => [
+        label,
+        calculateAvailability(monitor.created_at, monitorIncidents, days, now),
+      ]),
+    );
+
+    return {
+      id: monitor.id,
+      name: monitor.name,
+      url: monitor.url,
+      enabled: monitor.enabled === 1,
+      state: monitor.current_state,
+      interval_seconds: monitor.interval_seconds,
+      degraded_enabled: monitor.degraded_enabled === 1,
+      degraded_threshold_ms: monitor.degraded_threshold_ms,
+      last_checked_at: monitor.last_checked_at,
+      response_time_ms: monitor.last_response_time_ms,
+      status_code: monitor.last_status_code,
+      error: monitor.last_error,
+      availability,
+    };
+  });
+
+  const total = countResult?.total ?? 0;
+
+  return json({
+    monitors: dashboardMonitors,
+    pagination: {
+      page,
+      per_page: perPage,
+      total,
+      pages: total === 0 ? 0 : Math.ceil(total / perPage),
+    },
+    summary: {
+      total: summaryResult?.total ?? 0,
+      up: summaryResult?.up ?? 0,
+      degraded: summaryResult?.degraded ?? 0,
+      down: summaryResult?.down ?? 0,
+      unknown: summaryResult?.unknown ?? 0,
+    },
+    generated_at: now,
+  });
+}
+
 export async function handleApi(
   request: Request,
   env: Env,
@@ -192,9 +469,80 @@ export async function handleApi(
   const url = new URL(request.url);
   const parts = url.pathname.split("/").filter(Boolean);
   const id = parts[3];
-  const isResults = parts[4] === "results";
+  const resource = parts[4];
 
-  if (request.method === "GET" && parts.length === 3) {
+  if (
+    request.method === "GET" &&
+    parts.length === 3 &&
+    parts[2] === "dashboard"
+  ) {
+    return getDashboard(env, url);
+  }
+
+  if (
+    request.method === "POST" &&
+    parts.length === 4 &&
+    parts[2] === "monitoring" &&
+    parts[3] === "pause"
+  ) {
+    const result = await setMonitoringPaused(env, true);
+
+    try {
+      await notifyMonitoringServiceState(
+        env,
+        true,
+        result.total,
+        result.succeeded,
+        result.failed,
+      );
+    } catch (error) {
+      console.error("Slack service-state notification failed", error);
+    }
+
+    return json({
+      monitoring: "paused",
+      ...result,
+    }, result.failed === 0 ? 200 : 207);
+  }
+
+  if (
+    request.method === "POST" &&
+    parts.length === 4 &&
+    parts[2] === "monitoring" &&
+    parts[3] === "resume"
+  ) {
+    if (env.MONITORING_PAUSED === "true") {
+      return json({
+        error:
+          "Monitoring is paused by MONITORING_PAUSED configuration and cannot be resumed through the API",
+      }, 409);
+    }
+
+    const result = await setMonitoringPaused(env, false);
+
+    try {
+      await notifyMonitoringServiceState(
+        env,
+        false,
+        result.total,
+        result.succeeded,
+        result.failed,
+      );
+    } catch (error) {
+      console.error("Slack service-state notification failed", error);
+    }
+
+    return json({
+      monitoring: "running",
+      ...result,
+    }, result.failed === 0 ? 200 : 207);
+  }
+
+  if (
+    request.method === "GET" &&
+    parts.length === 3 &&
+    parts[2] === "monitors"
+  ) {
     const result = await env.DB.prepare(
       "SELECT * FROM monitors ORDER BY name ASC",
     ).all<MonitorRow>();
@@ -202,7 +550,11 @@ export async function handleApi(
     return json({ monitors: result.results });
   }
 
-  if (request.method === "POST" && parts.length === 3) {
+  if (
+    request.method === "POST" &&
+    parts.length === 3 &&
+    parts[2] === "monitors"
+  ) {
     try {
       const input = (await request.json()) as MonitorInput;
       const monitor = normaliseInput(input);
@@ -257,18 +609,73 @@ export async function handleApi(
     return json({ error: "Not found" }, 404);
   }
 
-  if (request.method === "GET" && isResults) {
+  if (request.method === "GET" && resource === "results") {
     const limit = Math.min(
       Math.max(Number.parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 1),
       500,
     );
 
-    const result = await env.DB.prepare(
-      "SELECT * FROM monitor_results WHERE monitor_id = ? " +
-        "ORDER BY checked_at DESC LIMIT ?",
-    ).bind(id, limit).all();
+    try {
+      return json(await getMonitorResults(env, id, limit));
+    } catch (error) {
+      return json(
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to read monitor results",
+        },
+        502,
+      );
+    }
+  }
 
-    return json({ results: result.results });
+  if (request.method === "GET" && resource === "stats") {
+    const resolution = url.searchParams.get("resolution") ?? "daily";
+
+    if (resolution !== "hourly" && resolution !== "daily") {
+      return json({ error: "resolution must be hourly or daily" }, 400);
+    }
+
+    const days = queryDays(url);
+    const cutoff = Date.now() - days * DAY_MS;
+    const table =
+      resolution === "hourly"
+        ? "monitor_hourly_stats"
+        : "monitor_daily_stats";
+
+    const result = await env.DB.prepare(
+      `SELECT
+        period_start,
+        checks,
+        up_checks,
+        degraded_checks,
+        down_checks,
+        CASE
+          WHEN checks > 0 THEN response_time_sum_ms * 1.0 / checks
+          ELSE NULL
+        END AS response_time_avg_ms,
+        response_time_min_ms,
+        response_time_max_ms
+      FROM ${table}
+      WHERE monitor_id = ? AND period_start >= ?
+      ORDER BY period_start ASC`,
+    ).bind(id, cutoff).all();
+
+    return json({ resolution, days, stats: result.results });
+  }
+
+  if (request.method === "GET" && resource === "incidents") {
+    const days = queryDays(url);
+    const cutoff = Date.now() - days * DAY_MS;
+
+    const result = await env.DB.prepare(
+      "SELECT * FROM monitor_incidents " +
+        "WHERE monitor_id = ? AND (ended_at IS NULL OR ended_at >= ?) " +
+        "ORDER BY started_at DESC",
+    ).bind(id, cutoff).all();
+
+    return json({ days, incidents: result.results });
   }
 
   if (request.method === "GET" && parts.length === 4) {
@@ -336,9 +743,12 @@ export async function handleApi(
       return new Response(null, { status: 204 });
     }
 
-    await stopMonitor(env, id);
+    await purgeMonitor(env, id);
     await env.DB.batch([
       env.DB.prepare("DELETE FROM monitor_results WHERE monitor_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM monitor_hourly_stats WHERE monitor_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM monitor_daily_stats WHERE monitor_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM monitor_incidents WHERE monitor_id = ?").bind(id),
       env.DB.prepare("DELETE FROM monitors WHERE id = ?").bind(id),
     ]);
 

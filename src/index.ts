@@ -1,4 +1,5 @@
 import { handleApi } from "./api";
+import { dashboardPage } from "./dashboard-page";
 import type { Env } from "./types";
 
 export { Monitor } from "./monitor";
@@ -13,6 +14,10 @@ export default {
         status: "ok",
         timestamp: new Date().toISOString(),
       });
+    }
+
+    if (url.pathname === "/dashboard") {
+      return dashboardPage();
     }
 
     if (url.pathname.startsWith("/api/v1/")) {

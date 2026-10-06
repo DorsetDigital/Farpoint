@@ -1,3 +1,5 @@
+export const CONFIRMATION_RETRY_SECONDS = 10;
+
 export function nextScheduledTime(
   intervalSeconds: number,
   offsetSeconds: number,
@@ -12,6 +14,35 @@ export function nextScheduledTime(
   }
 
   return candidate;
+}
+
+export function nextCheckTime(
+  intervalSeconds: number,
+  offsetSeconds: number,
+  currentState: "UNKNOWN" | "UP" | "DEGRADED" | "DOWN",
+  checkOk: boolean,
+  consecutiveFailures: number,
+  failureConfirmationChecks: number,
+  consecutiveSuccesses: number,
+  recoveryConfirmationChecks: number,
+  nowMs = Date.now(),
+): number {
+  const confirmingFailure =
+    !checkOk &&
+    consecutiveFailures > 0 &&
+    consecutiveFailures < failureConfirmationChecks;
+
+  const confirmingRecovery =
+    currentState === "DOWN" &&
+    checkOk &&
+    consecutiveSuccesses > 0 &&
+    consecutiveSuccesses < recoveryConfirmationChecks;
+
+  if (confirmingFailure || confirmingRecovery) {
+    return nowMs + CONFIRMATION_RETRY_SECONDS * 1000;
+  }
+
+  return nextScheduledTime(intervalSeconds, offsetSeconds, nowMs);
 }
 
 export function randomOffsetSeconds(): number {
